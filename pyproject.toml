@@ -1,0 +1,14 @@
+[project]
+name = "aibot"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = [
+    "black>=25.12.0",
+    "bs4>=0.0.2",
+    "fastapi>=0.127.0",
+    "openai>=2.14.0",
+    "pydantic-settings>=2.12.0",
+    "telethon>=1.42.0",
+    "uvicorn>=0.40.0",
+]
