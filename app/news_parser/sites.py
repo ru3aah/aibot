@@ -8,7 +8,6 @@ from pprint import pprint
 
 from datetime import timezone
 
-
 import requests
 import feedparser
 from bs4 import BeautifulSoup
