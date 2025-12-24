@@ -4,9 +4,11 @@ version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.13"
 dependencies = [
+    "beautifulsoup4>=4.14.3",
     "black>=25.12.0",
     "bs4>=0.0.2",
     "fastapi>=0.127.0",
+    "lxml>=6.0.2",
     "openai>=2.14.0",
     "pydantic-settings>=2.12.0",
     "requests>=2.32.5",
