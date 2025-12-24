@@ -3,7 +3,8 @@ from typing import Optional
 from sqlalchemy import Column, String, Boolean
 from sqlalchemy.orm import declarative_base
 
-from app.data_types import ID, URL, TextContent, TimeStamp, STATUS, SOURCE_TYPE
+from app.db.data_types import ID, URL, TextContent, TimeStamp, STATUS, \
+    SOURCE_TYPE
 
 Base = declarative_base()
 

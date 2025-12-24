@@ -4,7 +4,7 @@ import pydantic_settings
 
 
 class Settings(pydantic_settings):
-    DATABASE_URL: str = "sqlite:///./aibot.db"
+    DATABASE_URL: str = "sqlite:///db/aibot.db"
     REDIS_URL: str = "redis://localhost:6379/0"
 
     TELEGRAM_API_ID: Optional[str] = None
