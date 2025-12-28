@@ -40,7 +40,6 @@ def _ensure_sqlite_dir(db_url: str) -> None:
 
 
 async def init_engines() -> None:
-    """Initialize sync + async engines once."""
     global async_engine, sync_engine, AsyncSessionLocal, SessionLocal
 
     if async_engine is not None:
