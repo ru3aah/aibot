@@ -1,22 +1,27 @@
 from typing import AsyncGenerator
 from contextlib import contextmanager, asynccontextmanager
 
-from pydantic import with_config
 from sqlalchemy.ext.asyncio import (create_async_engine, async_sessionmaker,
                                     AsyncSession)
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 from app.config import settings
-from models import Base
+from app.database.models import Base
+
+async_database_url = settings.DATABASE_URL.replace("sqlite:///",
+                                                   "sqlite+aiosqlite:///")
+
 
 async_engine = create_async_engine(
-    settings.ASYNC_DATABASE_URL, 
+    #settings.ASYNC_DATABASE_URL,
+    async_database_url,
     echo=settings.DEBUG,
     pool_size=20,
     max_overflow=0
 )
 sync_engine = create_engine(
-    settings.SYNC_DATABASE_URL, 
+    #settings.SYNC_DATABASE_URL,
+    settings.DATABASE_URL,
     echo=settings.DEBUG,
     pool_size=20,
     max_overflow=0

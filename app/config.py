@@ -1,14 +1,21 @@
+from pathlib import Path
 from typing import Optional
 
-import pydantic_settings
+from pydantic_settings import BaseSettings
 
 
-class Settings(pydantic_settings):
-    DATABASE_URL: str = "sqlite:///db/aibot.db"
+BASE_DIR = Path(__file__).resolve().parent.parent  # app/
+
+
+class Settings(BaseSettings):
+    DATABASE_URL: str = (
+        f"sqlite+aiosqlite:///{BASE_DIR / 'database' / 'aibot.db'}"
+    )
+
     REDIS_URL: str = "redis://localhost:6379/0"
 
-    TELEGRAM_API_ID: Optional[str] = None
-    TELEGRAM_API_HASH: Optional[str] = None
+    TG_API_ID: Optional[str] = None
+    TG_API_HASH: Optional[str] = None
     TELEGRAM_SESSION_NAME: str = "aibot_session"
     TELEGRAM_CHANNEL: Optional[str] = None
     TELEGRAM_CHANNEL_USERNAME: Optional[str] = None
@@ -28,7 +35,7 @@ class Settings(pydantic_settings):
         env_file = ".env"
         env_file_encoding = "utf-8"
         case_sensitive = True
+        extra = "ignore"
+
 
 settings = Settings()
-
-
