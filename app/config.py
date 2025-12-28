@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     CELERY_BROKER_URL: str = "redis://localhost:6379/0"
     CELERY_RESULT_BACKEND: str = "redis://localhost:6379/0"
 
-    PARSE_INTERVAL_MINUTES: int = 30
+    PARSE_INTERVAL_MINUTES: int = 1
     PARSE_THREADS: int = 10
 
     DEBUG: bool = True
@@ -42,13 +42,6 @@ class Settings(BaseSettings):
         extra = "ignore"
 
     def _sqlite_force_into_app_database(self, url_str: str) -> str:
-        """
-        Force any relative sqlite file path into app/database/.
-        Examples:
-          sqlite:///aibot.db              -> app/database/aibot.db
-          sqlite:///database/aibot.db     -> app/database/aibot.db
-          sqlite:///app/database/aibot.db -> app/database/aibot.db
-        """
         u = make_url(url_str)
         if not u.drivername.startswith("sqlite"):
             return url_str
@@ -59,11 +52,9 @@ class Settings(BaseSettings):
 
         p = Path(db_path)
 
-        # if absolute -> keep as-is
         if p.is_absolute():
             return str(u)
 
-        # normalize common prefixes
         parts = list(p.parts)
         if parts[:2] == ["app", "database"]:
             parts = parts[2:]
@@ -79,15 +70,12 @@ class Settings(BaseSettings):
     async def choose_base_url(self) -> str:
         sqlite_url = self._sqlite_force_into_app_database(self.SQLITE_URL)
 
-        # Force sqlite
         if self.DB_MODE == "sqlite" or not self.POSTGRES_URL:
             return sqlite_url
 
-        # Force postgres
         if self.DB_MODE == "postgres":
             return self.POSTGRES_URL
 
-        # Auto: try Postgres, fallback to sqlite
         try:
             import asyncpg  # type: ignore
             u = make_url(self.POSTGRES_URL)

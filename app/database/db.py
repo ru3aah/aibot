@@ -18,10 +18,6 @@ from app.config import settings
 from app.database.models import Base
 
 
-# =========================
-# Globals (lazy init)
-# =========================
-
 async_engine = None
 sync_engine = None
 
@@ -29,12 +25,7 @@ AsyncSessionLocal: async_sessionmaker[AsyncSession] | None = None
 SessionLocal: sessionmaker[Session] | None = None
 
 
-# =========================
-# Helpers
-# =========================
-
 def _ensure_sqlite_dir(db_url: str) -> None:
-    """Ensure directory exists for SQLite file DB."""
     if not db_url.startswith("sqlite"):
         return
 
@@ -47,9 +38,6 @@ def _ensure_sqlite_dir(db_url: str) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
 
 
-# =========================
-# Engine initialization
-# =========================
 
 async def init_engines() -> None:
     """Initialize sync + async engines once."""
@@ -58,7 +46,6 @@ async def init_engines() -> None:
     if async_engine is not None:
         return
 
-    # Decide base DB URL (postgres or sqlite)
     base_url = await settings.choose_base_url()
     base_url = str(base_url)
 
@@ -71,11 +58,9 @@ async def init_engines() -> None:
         async_url = str(u.set(drivername="postgresql+asyncpg"))
         sync_url = str(u.set(drivername="postgresql+psycopg"))
 
-    # Ensure sqlite directory exists
     _ensure_sqlite_dir(async_url)
     _ensure_sqlite_dir(sync_url)
 
-    # Create async engine (FastAPI runtime)
     async_engine = create_async_engine(
         async_url,
         echo=settings.DEBUG,
@@ -87,7 +72,6 @@ async def init_engines() -> None:
         expire_on_commit=False,
     )
 
-    # Create sync engine (Alembic / scripts)
     sync_engine = create_engine(
         sync_url,
         echo=settings.DEBUG,
@@ -102,20 +86,8 @@ async def init_engines() -> None:
         expire_on_commit=False,
     )
 
-    print(">>> EFFECTIVE BASE URL:", base_url)
-    print(">>> ASYNC URL:", async_url)
-    print(">>> SYNC  URL:", sync_url)
-
-
-# =========================
-# Public API (what main.py expects)
-# =========================
 
 async def init_db() -> None:
-    """
-    Create tables at startup (DEV ONLY).
-    In production, use Alembic migrations instead.
-    """
     await init_engines()
     async with async_engine.begin() as conn:  # type: ignore[union-attr]
         await conn.run_sync(Base.metadata.create_all)
