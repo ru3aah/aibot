@@ -1,22 +1,26 @@
 import uuid
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Annotated, Optional
+from typing import Annotated
 
-from sqlalchemy import DateTime, Enum, String, Text
+from sqlalchemy import String, DateTime, Enum, Text
 from sqlalchemy.orm import mapped_column
-
-
-class PostStatus(StrEnum):
-    NEW = "new"
-    GENERATED = "generated"
-    PUBLISHED = "published"
-    FAILED = "failed"
 
 
 class SourceType(StrEnum):
     SITE = "site"
-    TELEGRAM = "tg"
+    TG = "tg"
+
+
+class PostStatus(StrEnum):
+    # ВАЖНО: значения должны совпадать с тем, что лежит в БД (alembic enum)
+    NEW = "NEW"
+    GENERATED = "GENERATED"
+    PUBLISHED = "PUBLISHED"
+    FAILED = "FAILED"
+
+    SKIPPED_QUOTA = "SKIPPED_QUOTA"
+    RETRYABLE = "RETRYABLE"
 
 
 PK = Annotated[
@@ -24,7 +28,6 @@ PK = Annotated[
     mapped_column(
         String,
         primary_key=True,
-        index=True,
         default=lambda: str(uuid.uuid4()),
     ),
 ]
@@ -34,35 +37,11 @@ FK = Annotated[
     mapped_column(
         String,
         nullable=False,
-        index=True,
     ),
-]
-
-URL_REQUIRED = Annotated[
-    str,
-    mapped_column(
-        String,
-        nullable=False,
-        index=True,
-    ),
-]
-
-URL_OPTIONAL = Annotated[
-    Optional[str],
-    mapped_column(
-        String,
-        nullable=True,
-        index=True,
-    ),
-]
-
-TextContent = Annotated[
-    str,
-    mapped_column(Text, nullable=False),
 ]
 
 TextContentOptional = Annotated[
-    Optional[str],
+    str,
     mapped_column(Text, nullable=True),
 ]
 
@@ -71,32 +50,19 @@ TimeStamp = Annotated[
     mapped_column(
         DateTime(timezone=True),
         nullable=False,
-        index=True,
         default=lambda: datetime.now(timezone.utc),
     ),
 ]
 
 TimeStampOptional = Annotated[
-    Optional[datetime],
+    datetime,
     mapped_column(
         DateTime(timezone=True),
         nullable=True,
-        index=True,
     ),
 ]
 
 STATUS = Annotated[
     PostStatus,
-    mapped_column(
-        Enum(PostStatus, native_enum=False),
-        nullable=False,
-    ),
-]
-
-SOURCE_TYPE = Annotated[
-    SourceType,
-    mapped_column(
-        Enum(SourceType, native_enum=False),
-        nullable=False,
-    ),
+    mapped_column(Enum(PostStatus, native_enum=False), nullable=False),
 ]

@@ -3,12 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional, Literal
 
-from pydantic import Field
 from pydantic_settings import BaseSettings
 from sqlalchemy.engine import make_url
 
-APP_DIR = Path(__file__).resolve().parent           # .../aibot/app
-APP_DATABASE_DIR = APP_DIR / "database"             # .../aibot/app/database
+APP_DIR = Path(__file__).resolve().parent
+APP_DATABASE_DIR = APP_DIR / "database"
 
 
 class Settings(BaseSettings):
@@ -25,10 +24,11 @@ class Settings(BaseSettings):
     TELEGRAM_CHANNEL: Optional[str] = None
     TELEGRAM_CHANNEL_USERNAME: Optional[str] = None
 
-    # ✅ Каноничные имена (как ты используешь в коде: settings.OPENAI_API_KEY / settings.OPENAI_MODEL)
-    # + совместимость с твоими старыми OPEN_AI_* переменными в .env через alias.
-    OPENAI_API_KEY: Optional[str] = Field(default=None, validation_alias="OPEN_AI_API_KEY")
-    OPENAI_MODEL: str = Field(default="gpt-3.5-turbo", validation_alias="OPEN_AI_MODEL")
+    # TG Bot (optional)
+    TG_BOT_TOKEN: Optional[str] = None
+
+    OPEN_AI_API_KEY: Optional[str] = None
+    OPEN_AI_MODEL: str = "gpt-4o-mini"
 
     CELERY_BROKER_URL: str = "redis://localhost:6379/0"
     CELERY_RESULT_BACKEND: str = "redis://localhost:6379/0"
@@ -54,7 +54,6 @@ class Settings(BaseSettings):
             return url_str
 
         p = Path(db_path)
-
         if p.is_absolute():
             return str(u)
 
@@ -65,7 +64,6 @@ class Settings(BaseSettings):
             parts = parts[1:]
 
         rel = Path(*parts) if parts else Path(p.name)
-
         APP_DATABASE_DIR.mkdir(parents=True, exist_ok=True)
         forced = (APP_DATABASE_DIR / rel).resolve()
         return f"{u.drivername}:///{forced.as_posix()}"

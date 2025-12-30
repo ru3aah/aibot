@@ -1,38 +1,42 @@
-# app/ai/generator.py
+import json
 import logging
+from typing import Sequence, Tuple, Optional
 
 from app.ai.openai_client import make_request
 from app.database.models import NewsItem
+from app.database.data_types import PostStatus
 
 logger = logging.getLogger(__name__)
 
 INSTRUCTIONS = """
-Вы — редактор Telegram-канала.
-Сделай краткое, интересное описание новости для Telegram-поста:
-- 1–3 предложения
-- 1–2 emoji
-- лёгкий call to action
+На основе набора новостей сделай один Telegram-пост.
+6–10 строк, эмодзи, 1 call-to-action.
 """
 
+def generate_chain_post(
+    news_items: Sequence[NewsItem],
+) -> Tuple[Optional[str], PostStatus, Optional[str], str, str]:
 
-def generate_post_text(news: NewsItem) -> str | None:
-    source_name = None
-    try:
-        source_name = news.source.name if news.source else None
-    except Exception:
-        source_name = None
+    if not news_items:
+        return None, PostStatus.FAILED, "no news", "[]", "empty"
 
-    prompt = f"""
-Новость: {news.title}
-Содержание: {news.summary}
-Источник: {source_name or "unknown"}
-"""
+    input_ids = [n.id for n in news_items]
+    input_key = "-".join(n.id[:6] for n in news_items)
 
-    logger.info("Генерация поста для новости: %s", news.id)
-    post_text = make_request(INSTRUCTIONS, prompt)
+    parts = []
+    for i, n in enumerate(news_items, 1):
+        body = (n.raw_text or n.summary or "")[:800]
+        parts.append(f"{i}. {n.title}\n{body}\n")
 
-    if not post_text:
-        logger.warning("OpenAI вернул пустой результат для новости %s", news.id)
-        return None
+    prompt = "\n".join(parts)
 
-    return post_text.strip()
+    text, status, error = make_request(INSTRUCTIONS, prompt)
+
+    if status == PostStatus.GENERATED and text:
+        return text, status, None, json.dumps(input_ids), input_key
+
+    if status in (PostStatus.SKIPPED_QUOTA, PostStatus.RETRYABLE):
+        return None, status, error, json.dumps(input_ids), input_key
+
+    fallback = "🧩 Новости:\n" + "\n".join(f"• {n.title}" for n in news_items)
+    return fallback, PostStatus.GENERATED, "fallback_used", json.dumps(input_ids), input_key

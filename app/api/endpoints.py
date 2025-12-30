@@ -26,20 +26,17 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api")
 
-# Constants
 MAX_LIMIT = 100
 DEFAULT_LIMIT = 20
 
 
 def validate_pagination(offset: int, limit: int) -> tuple[int, int]:
-    """Validate and sanitize pagination parameters."""
     offset = max(0, offset)
     limit = min(max(1, limit), MAX_LIMIT)
     return offset, limit
 
 
 def validate_search_query(q: Optional[str]) -> Optional[str]:
-    """Validate and sanitize search query."""
     if not q:
         return None
     q = q.strip()
@@ -70,7 +67,6 @@ async def list_sources(
         offset, limit = validate_pagination(offset, limit)
         result = await db.execute(select(Source).offset(offset).limit(limit))
         sources = result.scalars().all()
-        logger.info("Retrieved %s sources", len(sources))
         return sources
     except SQLAlchemyError as e:
         logger.error("Database error in list_sources: %s", e)
@@ -78,10 +74,7 @@ async def list_sources(
 
 
 @router.get("/sources/{source_id}", response_model=SourceResponse, tags=["sources"])
-async def get_source(
-    source_id: str,
-    db: AsyncSession = Depends(get_db),
-):
+async def get_source(source_id: str, db: AsyncSession = Depends(get_db)):
     try:
         source = await db.get(Source, source_id)
         if not source:
@@ -92,22 +85,13 @@ async def get_source(
         raise HTTPException(status_code=500, detail="Database error occurred")
 
 
-@router.post(
-    "/sources/",
-    status_code=status.HTTP_201_CREATED,
-    response_model=SourceResponse,
-    tags=["sources"],
-)
-async def create_source(
-    source_data: SourceCreate,
-    db: AsyncSession = Depends(get_db),
-):
+@router.post("/sources/", status_code=status.HTTP_201_CREATED, response_model=SourceResponse, tags=["sources"])
+async def create_source(source_data: SourceCreate, db: AsyncSession = Depends(get_db)):
     try:
         source = Source(**source_data.model_dump())
         db.add(source)
         await db.commit()
         await db.refresh(source)
-        logger.info("Created source: %s", source.id)
         return source
     except IntegrityError as e:
         await db.rollback()
@@ -120,11 +104,7 @@ async def create_source(
 
 
 @router.patch("/sources/{source_id}", response_model=SourceResponse, tags=["sources"])
-async def update_source(
-    source_id: str,
-    source_data: SourceUpdate,
-    db: AsyncSession = Depends(get_db),
-):
+async def update_source(source_id: str, source_data: SourceUpdate, db: AsyncSession = Depends(get_db)):
     try:
         source = await db.get(Source, source_id)
         if not source:
@@ -136,7 +116,6 @@ async def update_source(
 
         await db.commit()
         await db.refresh(source)
-        logger.info("Updated source: %s", source.id)
         return source
     except HTTPException:
         raise
@@ -151,10 +130,7 @@ async def update_source(
 
 
 @router.delete("/sources/{source_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["sources"])
-async def delete_source(
-    source_id: str,
-    db: AsyncSession = Depends(get_db),
-):
+async def delete_source(source_id: str, db: AsyncSession = Depends(get_db)):
     try:
         source = await db.get(Source, source_id)
         if not source:
@@ -162,7 +138,6 @@ async def delete_source(
 
         await db.delete(source)
         await db.commit()
-        logger.info("Deleted source: %s", source_id)
         return None
     except HTTPException:
         raise
@@ -186,7 +161,6 @@ async def list_posts(
         offset, limit = validate_pagination(offset, limit)
         result = await db.execute(select(Post).offset(offset).limit(limit))
         posts = result.scalars().all()
-        logger.info("Retrieved %s posts", len(posts))
         return posts
     except SQLAlchemyError as e:
         logger.error("Database error in list_posts: %s", e)
@@ -194,10 +168,7 @@ async def list_posts(
 
 
 @router.get("/posts/{post_id}", response_model=PostResponse, tags=["posts"])
-async def get_post(
-    post_id: str,
-    db: AsyncSession = Depends(get_db),
-):
+async def get_post(post_id: str, db: AsyncSession = Depends(get_db)):
     try:
         post = await db.get(Post, post_id)
         if not post:
@@ -229,9 +200,7 @@ async def list_keywords(
 
         stmt = stmt.offset(offset).limit(limit)
         result = await db.execute(stmt)
-        keywords = result.scalars().all()
-        logger.info("Retrieved %s keywords (q=%s)", len(keywords), search_query)
-        return keywords
+        return result.scalars().all()
     except HTTPException:
         raise
     except SQLAlchemyError as e:
@@ -240,10 +209,7 @@ async def list_keywords(
 
 
 @router.get("/keywords/{keyword_id}", response_model=KeywordResponse, tags=["keywords"])
-async def get_keyword(
-    keyword_id: str,
-    db: AsyncSession = Depends(get_db),
-):
+async def get_keyword(keyword_id: str, db: AsyncSession = Depends(get_db)):
     try:
         keyword = await db.get(Keyword, keyword_id)
         if not keyword:
@@ -255,10 +221,7 @@ async def get_keyword(
 
 
 @router.post("/keywords/", status_code=status.HTTP_201_CREATED, response_model=KeywordResponse, tags=["keywords"])
-async def create_keyword(
-    payload: KeywordCreate,
-    db: AsyncSession = Depends(get_db),
-):
+async def create_keyword(payload: KeywordCreate, db: AsyncSession = Depends(get_db)):
     try:
         word = payload.word.strip()
         if len(word) < 2:
@@ -272,7 +235,6 @@ async def create_keyword(
         db.add(keyword)
         await db.commit()
         await db.refresh(keyword)
-        logger.info("Created keyword: %s", keyword.id)
         return keyword
     except HTTPException:
         raise
@@ -287,11 +249,7 @@ async def create_keyword(
 
 
 @router.patch("/keywords/{keyword_id}", response_model=KeywordResponse, tags=["keywords"])
-async def update_keyword(
-    keyword_id: str,
-    payload: KeywordUpdate,
-    db: AsyncSession = Depends(get_db),
-):
+async def update_keyword(keyword_id: str, payload: KeywordUpdate, db: AsyncSession = Depends(get_db)):
     try:
         keyword = await db.get(Keyword, keyword_id)
         if not keyword:
@@ -313,7 +271,6 @@ async def update_keyword(
 
         await db.commit()
         await db.refresh(keyword)
-        logger.info("Updated keyword: %s", keyword.id)
         return keyword
     except HTTPException:
         raise
@@ -328,10 +285,7 @@ async def update_keyword(
 
 
 @router.delete("/keywords/{keyword_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["keywords"])
-async def delete_keyword(
-    keyword_id: str,
-    db: AsyncSession = Depends(get_db),
-):
+async def delete_keyword(keyword_id: str, db: AsyncSession = Depends(get_db)):
     try:
         keyword = await db.get(Keyword, keyword_id)
         if not keyword:
@@ -339,7 +293,6 @@ async def delete_keyword(
 
         await db.delete(keyword)
         await db.commit()
-        logger.info("Deleted keyword: %s", keyword_id)
         return None
     except HTTPException:
         raise
@@ -377,6 +330,7 @@ async def list_news(
                 or_(
                     NewsItem.title.ilike(f"%{search_query}%"),
                     NewsItem.summary.ilike(f"%{search_query}%"),
+                    NewsItem.raw_text.ilike(f"%{search_query}%"),
                 )
             )
 
@@ -389,9 +343,7 @@ async def list_news(
         stmt = stmt.order_by(NewsItem.created_at.desc()).offset(offset).limit(limit)
 
         result = await db.execute(stmt)
-        items = result.scalars().all()
-        logger.info("Retrieved %s news items", len(items))
-        return items
+        return result.scalars().all()
     except HTTPException:
         raise
     except SQLAlchemyError as e:
@@ -400,10 +352,7 @@ async def list_news(
 
 
 @router.get("/news/{news_id}", response_model=NewsItemResponse, tags=["news"])
-async def get_news_item(
-    news_id: str,
-    db: AsyncSession = Depends(get_db),
-):
+async def get_news_item(news_id: str, db: AsyncSession = Depends(get_db)):
     try:
         item = await db.get(NewsItem, news_id)
         if not item:
@@ -418,35 +367,24 @@ async def get_news_item(
 # Task triggers
 # =========================
 
-@router.post(
-    "/tasks/parse",
-    response_model=TaskTriggerResponse,
-    status_code=status.HTTP_202_ACCEPTED,
-    tags=["tasks"],
-)
+@router.post("/tasks/parse", response_model=TaskTriggerResponse, status_code=status.HTTP_202_ACCEPTED, tags=["tasks"])
 async def trigger_parse_news():
-    """Ручной триггер: запустить Celery задачу парсинга новостей."""
     try:
         result = celery_app.send_task("app.tasks.parse_news", queue="aibot")
-        logger.info("Triggered parse news task: %s", result.id)
         return {"task_id": result.id, "task_name": "app.tasks.parse_news"}
     except Exception as e:
         logger.error("Failed to trigger parse news task: %s", e)
         raise HTTPException(status_code=500, detail="Failed to trigger task")
 
 
-@router.post(
-    "/tasks/generate",
-    response_model=TaskTriggerResponse,
-    status_code=status.HTTP_202_ACCEPTED,
-    tags=["tasks"],
-)
-async def trigger_generate_posts():
-    """Ручной триггер: запустить Celery задачу генерации постов."""
+@router.post("/tasks/generate", response_model=TaskTriggerResponse, status_code=status.HTTP_202_ACCEPTED, tags=["tasks"])
+async def trigger_generate_chain_post():
+    """
+    Ручной триггер: сгенерировать 1 агрегированный пост по последним PARSE_THREADS новостям из БД.
+    """
     try:
-        result = celery_app.send_task("app.tasks.generate_posts", queue="aibot")
-        logger.info("Triggered generate posts task: %s", result.id)
-        return {"task_id": result.id, "task_name": "app.tasks.generate_posts"}
+        result = celery_app.send_task("app.tasks.generate_chain_post", queue="aibot")
+        return {"task_id": result.id, "task_name": "app.tasks.generate_chain_post"}
     except Exception as e:
-        logger.error("Failed to trigger generate posts task: %s", e)
+        logger.error("Failed to trigger generate_chain_post task: %s", e)
         raise HTTPException(status_code=500, detail="Failed to trigger task")

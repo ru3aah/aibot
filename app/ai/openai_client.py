@@ -1,51 +1,67 @@
-# app/ai/openai_client.py
 import logging
+from typing import Optional, Tuple
 
-from openai import OpenAI, RateLimitError, OpenAIError
+from openai import OpenAI
+from openai import RateLimitError, OpenAIError, AuthenticationError, BadRequestError, APIError
+
 from app.config import settings
+from app.database.data_types import PostStatus
 
 logger = logging.getLogger(__name__)
 
 
-def _get_client() -> OpenAI | None:
-    key = getattr(settings, "OPEN_AI_API_KEY", None)
-    if not key:
+def _get_client() -> Optional[OpenAI]:
+    if not settings.OPEN_AI_API_KEY:
         return None
-    return OpenAI(api_key=key)
+    return OpenAI(api_key=settings.OPEN_AI_API_KEY)
 
 
 def make_request(
     instructions: str,
     prompt: str,
     temperature: float = 0.7,
-    max_tokens: int = 500,
-) -> str | None:
+    max_tokens: int = 700,
+) -> Tuple[Optional[str], PostStatus, Optional[str]]:
+
     client = _get_client()
     if not client:
-        logger.warning("OPEN_AI_API_KEY не задан — генерация пропущена")
-        return None
+        return None, PostStatus.SKIPPED_QUOTA, "OPEN_AI_API_KEY missing"
 
-    model = getattr(settings, "OPEN_AI_MODEL", None)
-    if not model:
-        logger.warning("OPEN_AI_MODEL не задан — генерация пропущена")
-        return None
+    if not settings.OPEN_AI_MODEL:
+        return None, PostStatus.FAILED, "OPEN_AI_MODEL missing"
 
     try:
         response = client.responses.create(
-            model=model,
+            model=settings.OPEN_AI_MODEL,
             instructions=instructions,
             input=prompt,
             temperature=temperature,
             max_output_tokens=max_tokens,
         )
-        return response.output_text
+
+        text = getattr(response, "output_text", None)
+        if text and text.strip():
+            return text.strip(), PostStatus.GENERATED, None
+
+        return None, PostStatus.RETRYABLE, "empty output_text"
+
+    except AuthenticationError as e:
+        return None, PostStatus.FAILED, str(e)
+
+    except BadRequestError as e:
+        return None, PostStatus.FAILED, str(e)
 
     except RateLimitError as e:
-        logger.error("Rate limit error: %s", e)
-        return None
+        msg = str(e)
+        if "insufficient_quota" in msg:
+            return None, PostStatus.SKIPPED_QUOTA, msg
+        return None, PostStatus.RETRYABLE, msg
+
+    except APIError as e:
+        return None, PostStatus.RETRYABLE, str(e)
+
     except OpenAIError as e:
-        logger.error("OpenAI API error: %s", e)
-        return None
+        return None, PostStatus.RETRYABLE, str(e)
+
     except Exception as e:
-        logger.error("OpenAI unknown error: %s", e, exc_info=True)
-        return None
+        return None, PostStatus.RETRYABLE, str(e)

@@ -7,10 +7,10 @@ from app.database.data_types import SourceType, PostStatus
 
 
 class SourceBase(BaseModel):
-    type: SourceType = Field(..., description='Тип источника')
-    name: str = Field(..., description='Название источника')
-    url: Optional[str] = Field(None, description='URL-адрес источника')
-    enabled: bool = Field(default=True, description='Включен ли источник(для парсинга)')
+    type: SourceType = Field(..., description="Тип источника")
+    name: str = Field(..., description="Название источника")
+    url: Optional[str] = Field(None, description="URL-адрес источника")
+    enabled: bool = Field(default=True, description="Включен ли источник(для парсинга)")
 
 
 class SourceCreate(SourceBase):
@@ -47,22 +47,23 @@ class KeywordResponse(KeywordBase):
         from_attributes = True
 
 
-
 class KeywordUpdate(BaseModel):
     word: Optional[str] = None
+
 
 class TaskTriggerResponse(BaseModel):
     task_id: str
     task_name: str
 
+
 class NewsItemResponse(BaseModel):
     id: str
     title: str
     url: Optional[str]
-    summary: str
+    summary: Optional[str]
     raw_text: Optional[str]
     source_id: str
-    published_at: datetime
+    published_at: Optional[datetime]
     created_at: datetime
 
     class Config:
@@ -71,12 +72,11 @@ class NewsItemResponse(BaseModel):
 
 class PostResponse(BaseModel):
     id: str
-    news_id: str
+    news_id: Optional[str]
     generated_text: Optional[str]
     published_at: Optional[datetime]
     status: PostStatus
     created_at: datetime
-    # TODO: news_item: NewsItemResponse
 
     class Config:
         from_attributes = True
