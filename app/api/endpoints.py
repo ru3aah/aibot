@@ -388,3 +388,16 @@ async def trigger_generate_chain_post():
     except Exception as e:
         logger.error("Failed to trigger generate_chain_post task: %s", e)
         raise HTTPException(status_code=500, detail="Failed to trigger task")
+
+
+@router.post("/tasks/publish", response_model=TaskTriggerResponse, status_code=status.HTTP_202_ACCEPTED, tags=["tasks"])
+async def trigger_publish_latest_post():
+    """
+    Ручной триггер: опубликовать 1 самый свежий пост со статусом GENERATED.
+    """
+    try:
+        result = celery_app.send_task("app.tasks.publish_latest_post", queue="aibot")
+        return {"task_id": result.id, "task_name": "app.tasks.publish_latest_post"}
+    except Exception as e:
+        logger.error("Failed to trigger publish_latest_post task: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to trigger task")

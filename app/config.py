@@ -27,8 +27,8 @@ class Settings(BaseSettings):
     # TG Bot (optional)
     TG_BOT_TOKEN: Optional[str] = None
 
-    OPEN_AI_API_KEY: Optional[str] = None
-    OPEN_AI_MODEL: str = "gpt-4o-mini"
+    OPENAI_API_KEY: Optional[str] = None
+    OPENAI_MODEL: str = "gpt-4o-mini"
 
     CELERY_BROKER_URL: str = "redis://localhost:6379/0"
     CELERY_RESULT_BACKEND: str = "redis://localhost:6379/0"
