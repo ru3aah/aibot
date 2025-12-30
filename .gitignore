@@ -4,4 +4,15 @@
 *.db
 __pycash__
 
-/celerybeat-schedule
+# mac
+.DS_Store
+
+# local env
+.env
+
+# sqlite db
+*.db
+
+# celery beat schedule
+celerybeat-schedule
+celerybeat-schedule.db

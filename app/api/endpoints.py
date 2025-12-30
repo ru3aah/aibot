@@ -1,58 +1,66 @@
 import logging
-from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.exc import SQLAlchemyError, IntegrityError
-
-from app.api.schemas import SourceResponse, SourceCreate, SourceUpdate, PostResponse
-from app.database.db import get_db
-from app.database.models import Source, Post
-
 from datetime import datetime
-from sqlalchemy import or_
-from app.api.schemas import (KeywordResponse, KeywordCreate, KeywordUpdate, 
-                             NewsItemResponse, TaskTriggerResponse)
-from app.database.models import Keyword, NewsItem
+from typing import List, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import or_, select
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from celery_worker import celery_app
+from app.api.schemas import (
+    KeywordCreate,
+    KeywordResponse,
+    KeywordUpdate,
+    NewsItemResponse,
+    PostResponse,
+    SourceCreate,
+    SourceResponse,
+    SourceUpdate,
+    TaskTriggerResponse,
+)
+from app.database.db import get_db
+from app.database.models import Keyword, NewsItem, Post, Source
 
 logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api")
 
 # Constants
 MAX_LIMIT = 100
 DEFAULT_LIMIT = 20
 
+
 def validate_pagination(offset: int, limit: int) -> tuple[int, int]:
-    """Validate and sanitize pagination parameters"""
+    """Validate and sanitize pagination parameters."""
     offset = max(0, offset)
     limit = min(max(1, limit), MAX_LIMIT)
     return offset, limit
 
+
 def validate_search_query(q: Optional[str]) -> Optional[str]:
-    """Validate and sanitize search query"""
+    """Validate and sanitize search query."""
     if not q:
         return None
     q = q.strip()
     if len(q) < 2:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Search query must be at least 2 characters long"
+            detail="Search query must be at least 2 characters long",
         )
     if len(q) > 100:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Search query too long"
+            detail="Search query too long",
         )
     return q
+
 
 # =========================
 # Sources
 # =========================
 
-@router.get("/sources/", response_model=List[SourceResponse], 
-            tags=["sources"]) 
+@router.get("/sources/", response_model=List[SourceResponse], tags=["sources"])
 async def list_sources(
     offset: int = Query(0, ge=0),
     limit: int = Query(DEFAULT_LIMIT, ge=1, le=MAX_LIMIT),
@@ -62,14 +70,27 @@ async def list_sources(
         offset, limit = validate_pagination(offset, limit)
         result = await db.execute(select(Source).offset(offset).limit(limit))
         sources = result.scalars().all()
-        logger.info(f"Retrieved {len(sources)} sources")
+        logger.info("Retrieved %s sources", len(sources))
         return sources
     except SQLAlchemyError as e:
-        logger.error(f"Database error in list_sources: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Database error occurred"
-        )
+        logger.error("Database error in list_sources: %s", e)
+        raise HTTPException(status_code=500, detail="Database error occurred")
+
+
+@router.get("/sources/{source_id}", response_model=SourceResponse, tags=["sources"])
+async def get_source(
+    source_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        source = await db.get(Source, source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Источник с данным id не найден")
+        return source
+    except SQLAlchemyError as e:
+        logger.error("Database error in get_source(%s): %s", source_id, e)
+        raise HTTPException(status_code=500, detail="Database error occurred")
+
 
 @router.post(
     "/sources/",
@@ -86,25 +107,19 @@ async def create_source(
         db.add(source)
         await db.commit()
         await db.refresh(source)
-        logger.info(f"Created source: {source.id}")
+        logger.info("Created source: %s", source.id)
         return source
     except IntegrityError as e:
         await db.rollback()
-        logger.error(f"Integrity error creating source: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Source with this data already exists"
-        )
+        logger.error("Integrity error creating source: %s", e)
+        raise HTTPException(status_code=409, detail="Source with this data already exists")
     except SQLAlchemyError as e:
         await db.rollback()
-        logger.error(f"Database error creating source: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create source"
-        )
+        logger.error("Database error creating source: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to create source")
 
-@router.patch("/sources/{source_id}", response_model=SourceResponse, 
-              tags=["sources"])
+
+@router.patch("/sources/{source_id}", response_model=SourceResponse, tags=["sources"])
 async def update_source(
     source_id: str,
     source_data: SourceUpdate,
@@ -113,10 +128,7 @@ async def update_source(
     try:
         source = await db.get(Source, source_id)
         if not source:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Resource not found",
-            )
+            raise HTTPException(status_code=404, detail="Источник с данным id не найден")
 
         data = source_data.model_dump(exclude_unset=True)
         for key, value in data.items():
@@ -124,28 +136,21 @@ async def update_source(
 
         await db.commit()
         await db.refresh(source)
-        logger.info(f"Updated source: {source.id}")
+        logger.info("Updated source: %s", source.id)
         return source
     except HTTPException:
         raise
     except IntegrityError as e:
         await db.rollback()
-        logger.error(f"Integrity error updating source {source_id}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Update violates data constraints"
-        )
+        logger.error("Integrity error updating source %s: %s", source_id, e)
+        raise HTTPException(status_code=409, detail="Update violates data constraints")
     except SQLAlchemyError as e:
         await db.rollback()
-        logger.error(f"Database error updating source {source_id}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to update source"
-        )
+        logger.error("Database error updating source %s: %s", source_id, e)
+        raise HTTPException(status_code=500, detail="Failed to update source")
 
-@router.delete("/sources/{source_id}", 
-               status_code=status.HTTP_204_NO_CONTENT, 
-               tags=["sources"])
+
+@router.delete("/sources/{source_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["sources"])
 async def delete_source(
     source_id: str,
     db: AsyncSession = Depends(get_db),
@@ -153,30 +158,61 @@ async def delete_source(
     try:
         source = await db.get(Source, source_id)
         if not source:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Resource not found",
-            )
+            raise HTTPException(status_code=404, detail="Источник с данным id не найден")
 
         await db.delete(source)
         await db.commit()
-        logger.info(f"Deleted source: {source_id}")
+        logger.info("Deleted source: %s", source_id)
+        return None
     except HTTPException:
         raise
     except SQLAlchemyError as e:
         await db.rollback()
-        logger.error(f"Database error deleting source {source_id}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to delete source"
-        )
+        logger.error("Database error deleting source %s: %s", source_id, e)
+        raise HTTPException(status_code=500, detail="Failed to delete source")
+
 
 # =========================
-# Keywords with improved search
+# Posts
 # =========================
 
-@router.get("/keywords/", response_model=List[KeywordResponse], 
-            tags=["keywords"])
+@router.get("/posts/", response_model=List[PostResponse], tags=["posts"])
+async def list_posts(
+    offset: int = Query(0, ge=0),
+    limit: int = Query(DEFAULT_LIMIT, ge=1, le=MAX_LIMIT),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        offset, limit = validate_pagination(offset, limit)
+        result = await db.execute(select(Post).offset(offset).limit(limit))
+        posts = result.scalars().all()
+        logger.info("Retrieved %s posts", len(posts))
+        return posts
+    except SQLAlchemyError as e:
+        logger.error("Database error in list_posts: %s", e)
+        raise HTTPException(status_code=500, detail="Database error occurred")
+
+
+@router.get("/posts/{post_id}", response_model=PostResponse, tags=["posts"])
+async def get_post(
+    post_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        post = await db.get(Post, post_id)
+        if not post:
+            raise HTTPException(status_code=404, detail="Пост с данным id не найден")
+        return post
+    except SQLAlchemyError as e:
+        logger.error("Database error in get_post(%s): %s", post_id, e)
+        raise HTTPException(status_code=500, detail="Database error occurred")
+
+
+# =========================
+# Keywords
+# =========================
+
+@router.get("/keywords/", response_model=List[KeywordResponse], tags=["keywords"])
 async def list_keywords(
     offset: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=MAX_LIMIT),
@@ -186,71 +222,71 @@ async def list_keywords(
     try:
         offset, limit = validate_pagination(offset, limit)
         search_query = validate_search_query(q)
-        
+
         stmt = select(Keyword)
         if search_query:
-            # Use parameter binding instead of f-strings for security
             stmt = stmt.where(Keyword.word.ilike(f"%{search_query}%"))
-        
+
         stmt = stmt.offset(offset).limit(limit)
         result = await db.execute(stmt)
         keywords = result.scalars().all()
-        
-        logger.info(f"Retrieved {len(keywords)} keywords with query: {search_query}")
+        logger.info("Retrieved %s keywords (q=%s)", len(keywords), search_query)
         return keywords
     except HTTPException:
         raise
     except SQLAlchemyError as e:
-        logger.error(f"Database error in list_keywords: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Database error occurred"
-        )
+        logger.error("Database error in list_keywords: %s", e)
+        raise HTTPException(status_code=500, detail="Database error occurred")
 
-@router.post("/keywords/", status_code=status.HTTP_201_CREATED, 
-             response_model=KeywordResponse, 
-             tags=["keywords"])
+
+@router.get("/keywords/{keyword_id}", response_model=KeywordResponse, tags=["keywords"])
+async def get_keyword(
+    keyword_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        keyword = await db.get(Keyword, keyword_id)
+        if not keyword:
+            raise HTTPException(status_code=404, detail="Ключевое слово не найдено")
+        return keyword
+    except SQLAlchemyError as e:
+        logger.error("Database error in get_keyword(%s): %s", keyword_id, e)
+        raise HTTPException(status_code=500, detail="Database error occurred")
+
+
+@router.post("/keywords/", status_code=status.HTTP_201_CREATED, response_model=KeywordResponse, tags=["keywords"])
 async def create_keyword(
     payload: KeywordCreate,
     db: AsyncSession = Depends(get_db),
 ):
     try:
-        # Validate word
         word = payload.word.strip()
         if len(word) < 2:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Keyword must be at least 2 characters long"
-            )
-        
-        # Check uniqueness
+            raise HTTPException(status_code=400, detail="Keyword must be at least 2 characters long")
+
         exists = await db.execute(select(Keyword).where(Keyword.word == word))
         if exists.scalar_one_or_none():
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT, 
-                detail="Keyword already exists"
-            )
+            raise HTTPException(status_code=409, detail="Keyword already exists")
 
-        keyword_data = payload.model_dump()
-        keyword_data['word'] = word
-        keyword = Keyword(**keyword_data)
+        keyword = Keyword(word=word)
         db.add(keyword)
         await db.commit()
         await db.refresh(keyword)
-        logger.info(f"Created keyword: {keyword.id}")
+        logger.info("Created keyword: %s", keyword.id)
         return keyword
     except HTTPException:
         raise
+    except IntegrityError as e:
+        await db.rollback()
+        logger.error("Integrity error creating keyword: %s", e)
+        raise HTTPException(status_code=409, detail="Keyword already exists")
     except SQLAlchemyError as e:
         await db.rollback()
-        logger.error(f"Database error creating keyword: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create keyword"
-        )
+        logger.error("Database error creating keyword: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to create keyword")
 
-@router.patch("/keywords/{keyword_id}", response_model=KeywordResponse, 
-              tags=["keywords"])
+
+@router.patch("/keywords/{keyword_id}", response_model=KeywordResponse, tags=["keywords"])
 async def update_keyword(
     keyword_id: str,
     payload: KeywordUpdate,
@@ -259,54 +295,65 @@ async def update_keyword(
     try:
         keyword = await db.get(Keyword, keyword_id)
         if not keyword:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, 
-                detail="Resource not found"
-            )
+            raise HTTPException(status_code=404, detail="Ключевое слово не найдено")
 
         data = payload.model_dump(exclude_unset=True)
-        if "word" in data and data["word"]:
+        if "word" in data and data["word"] is not None:
             new_word = data["word"].strip()
             if len(new_word) < 2:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Keyword must be at least 2 characters long"
-                )
-            
-            # Check uniqueness
+                raise HTTPException(status_code=400, detail="Keyword must be at least 2 characters long")
+
             exists = await db.execute(
-                select(Keyword).where(
-                    Keyword.word == new_word, 
-                    Keyword.id != keyword_id
-                )
+                select(Keyword).where(Keyword.word == new_word, Keyword.id != keyword_id)
             )
             if exists.scalar_one_or_none():
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT, 
-                    detail="Keyword already exists"
-                )
+                raise HTTPException(status_code=409, detail="Keyword already exists")
+
             keyword.word = new_word
 
         await db.commit()
         await db.refresh(keyword)
-        logger.info(f"Updated keyword: {keyword.id}")
+        logger.info("Updated keyword: %s", keyword.id)
         return keyword
+    except HTTPException:
+        raise
+    except IntegrityError as e:
+        await db.rollback()
+        logger.error("Integrity error updating keyword %s: %s", keyword_id, e)
+        raise HTTPException(status_code=409, detail="Update violates data constraints")
+    except SQLAlchemyError as e:
+        await db.rollback()
+        logger.error("Database error updating keyword %s: %s", keyword_id, e)
+        raise HTTPException(status_code=500, detail="Failed to update keyword")
+
+
+@router.delete("/keywords/{keyword_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["keywords"])
+async def delete_keyword(
+    keyword_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        keyword = await db.get(Keyword, keyword_id)
+        if not keyword:
+            raise HTTPException(status_code=404, detail="Ключевое слово не найдено")
+
+        await db.delete(keyword)
+        await db.commit()
+        logger.info("Deleted keyword: %s", keyword_id)
+        return None
     except HTTPException:
         raise
     except SQLAlchemyError as e:
         await db.rollback()
-        logger.error(f"Database error updating keyword {keyword_id}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to update keyword"
-        )
+        logger.error("Database error deleting keyword %s: %s", keyword_id, e)
+        raise HTTPException(status_code=500, detail="Failed to delete keyword")
+
 
 # =========================
-# News with improved search
+# News
 # =========================
 
-@router.get("/news/", response_model=List[NewsItemResponse], 
-            tags=["news"])
+@router.get("/news/", response_model=List[NewsItemResponse], tags=["news"])
 async def list_news(
     offset: int = Query(0, ge=0),
     limit: int = Query(DEFAULT_LIMIT, ge=1, le=MAX_LIMIT),
@@ -319,7 +366,7 @@ async def list_news(
     try:
         offset, limit = validate_pagination(offset, limit)
         search_query = validate_search_query(q)
-        
+
         stmt = select(NewsItem)
 
         if source_id:
@@ -340,22 +387,35 @@ async def list_news(
             stmt = stmt.where(NewsItem.published_at <= published_to)
 
         stmt = stmt.order_by(NewsItem.created_at.desc()).offset(offset).limit(limit)
+
         result = await db.execute(stmt)
-        news_items = result.scalars().all()
-        
-        logger.info(f"Retrieved {len(news_items)} news items")
-        return news_items
+        items = result.scalars().all()
+        logger.info("Retrieved %s news items", len(items))
+        return items
     except HTTPException:
         raise
     except SQLAlchemyError as e:
-        logger.error(f"Database error in list_news: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Database error occurred"
-        )
+        logger.error("Database error in list_news: %s", e)
+        raise HTTPException(status_code=500, detail="Database error occurred")
+
+
+@router.get("/news/{news_id}", response_model=NewsItemResponse, tags=["news"])
+async def get_news_item(
+    news_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        item = await db.get(NewsItem, news_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Новость не найдена")
+        return item
+    except SQLAlchemyError as e:
+        logger.error("Database error in get_news_item(%s): %s", news_id, e)
+        raise HTTPException(status_code=500, detail="Database error occurred")
+
 
 # =========================
-# Task triggers with error handling
+# Task triggers
 # =========================
 
 @router.post(
@@ -365,19 +425,15 @@ async def list_news(
     tags=["tasks"],
 )
 async def trigger_parse_news():
-    """
-    Ручной триггер: запустить Celery задачу парсинга новостей.
-    """
+    """Ручной триггер: запустить Celery задачу парсинга новостей."""
     try:
         result = celery_app.send_task("app.tasks.parse_news", queue="aibot")
-        logger.info(f"Triggered parse news task: {result.id}")
+        logger.info("Triggered parse news task: %s", result.id)
         return {"task_id": result.id, "task_name": "app.tasks.parse_news"}
     except Exception as e:
-        logger.error(f"Failed to trigger parse news task: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to trigger task"
-        )
+        logger.error("Failed to trigger parse news task: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to trigger task")
+
 
 @router.post(
     "/tasks/generate",
@@ -386,16 +442,11 @@ async def trigger_parse_news():
     tags=["tasks"],
 )
 async def trigger_generate_posts():
-    """
-    Ручной триггер: запустить Celery задачу генерации постов.
-    """
+    """Ручной триггер: запустить Celery задачу генерации постов."""
     try:
         result = celery_app.send_task("app.tasks.generate_posts", queue="aibot")
-        logger.info(f"Triggered generate posts task: {result.id}")
+        logger.info("Triggered generate posts task: %s", result.id)
         return {"task_id": result.id, "task_name": "app.tasks.generate_posts"}
     except Exception as e:
-        logger.error(f"Failed to trigger generate posts task: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to trigger task"
-        )
+        logger.error("Failed to trigger generate posts task: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to trigger task")
