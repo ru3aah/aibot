@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional, Literal
 
+from pydantic import Field
 from pydantic_settings import BaseSettings
 from sqlalchemy.engine import make_url
 
@@ -24,8 +25,10 @@ class Settings(BaseSettings):
     TELEGRAM_CHANNEL: Optional[str] = None
     TELEGRAM_CHANNEL_USERNAME: Optional[str] = None
 
-    OPEN_AI_API_KEY: Optional[str] = None
-    OPEN_AI_MODEL: str = "gpt-3.5-turbo"
+    # ✅ Каноничные имена (как ты используешь в коде: settings.OPENAI_API_KEY / settings.OPENAI_MODEL)
+    # + совместимость с твоими старыми OPEN_AI_* переменными в .env через alias.
+    OPENAI_API_KEY: Optional[str] = Field(default=None, validation_alias="OPEN_AI_API_KEY")
+    OPENAI_MODEL: str = Field(default="gpt-3.5-turbo", validation_alias="OPEN_AI_MODEL")
 
     CELERY_BROKER_URL: str = "redis://localhost:6379/0"
     CELERY_RESULT_BACKEND: str = "redis://localhost:6379/0"

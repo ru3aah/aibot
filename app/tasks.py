@@ -1,5 +1,6 @@
+# app/tasks.py
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
@@ -11,6 +12,10 @@ from app.database.models import NewsItem, Post, Source
 from app.utils import parse_site_source, parse_telegram_source
 
 logger = logging.getLogger(__name__)
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 @celery_app.task(name="app.tasks.parse_news", bind=True, max_retries=3)
@@ -33,7 +38,7 @@ def parse_news(self):
                 try:
                     if source.type == SourceType.SITE:
                         saved = parse_site_source(session, source)
-                    elif source.type == SourceType.TG:
+                    elif source.type == SourceType.TELEGRAM:
                         saved = parse_telegram_source(session, source)
                     else:
                         logger.warning(
@@ -100,9 +105,9 @@ def generate_posts_task(self):
                         Post(
                             news_id=news_item.id,
                             generated_text=post_text,
-                            status=PostStatus.DRAFT if post_text else PostStatus.FAILED,
+                            status=PostStatus.GENERATED if post_text else PostStatus.FAILED,
                             published_at=None,
-                            created_at=datetime.now(),
+                            created_at=_now_utc(),
                         )
                     )
 
@@ -110,10 +115,7 @@ def generate_posts_task(self):
                         generated_count += 1
                         logger.info("Сгенерирован пост для новости %s", news_item.id)
                     else:
-                        logger.warning(
-                            "Не удалось сгенерировать пост для новости %s",
-                            news_item.id,
-                        )
+                        logger.warning("Не удалось сгенерировать пост для новости %s", news_item.id)
 
                 except Exception as e:
                     logger.error(
@@ -128,7 +130,7 @@ def generate_posts_task(self):
                             generated_text=None,
                             status=PostStatus.FAILED,
                             published_at=None,
-                            created_at=datetime.now(),
+                            created_at=_now_utc(),
                         )
                     )
 

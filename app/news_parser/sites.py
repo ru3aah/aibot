@@ -1,39 +1,26 @@
-import os
 import logging
-import asyncio
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
-from pprint import pprint
 
-from datetime import timezone
-
-import requests
 import feedparser
+import requests
 from bs4 import BeautifulSoup
 
-from telethon import TelegramClient
 
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-
-
-TG_API_ID = os.getenv("TG_API_ID")
-TG_API_HASH = os.getenv("TG_API_HASH")
+logger = logging.getLogger(__name__)
 
 
 class Article:
     def __init__(
         self,
         source: str,
-        s_type: str,
+        s_type: str,  # "site"
         title: str,
         summary: str,
         published_at: Optional[datetime],
-        url: str,
+        url: Optional[str],
+        raw_text: Optional[str] = None,
     ):
         self.source = source
         self.type = s_type
@@ -41,14 +28,16 @@ class Article:
         self.summary = summary
         self.published_at = published_at
         self.url = url
+        self.raw_text = raw_text
+
 
 def to_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    """Normalize datetime to timezone-aware UTC."""
     if dt is None:
         return None
-
     if dt.tzinfo is None:
+        # считаем, что это уже UTC (чаще всего RSS даёт UTC без tzinfo)
         return dt.replace(tzinfo=timezone.utc)
-
     return dt.astimezone(timezone.utc)
 
 
@@ -59,16 +48,14 @@ class SiteParser(ABC):
 
     @abstractmethod
     def parse(self) -> List[Article]:
-        pass
+        raise NotImplementedError
 
     @abstractmethod
     def normalize_url(self, article_id: str):
-        pass
-
+        raise NotImplementedError
 
 
 class TechCrunchParser(SiteParser):
-
     FEED_URL = "https://techcrunch.com/feed/"
     MAX_ARTICLES = 10
 
@@ -82,34 +69,31 @@ class TechCrunchParser(SiteParser):
 
     def parse(self) -> List[Article]:
         feed = feedparser.parse(self.FEED_URL)
-        result = []
+        result: List[Article] = []
 
-        for entry in feed.entries[:self.MAX_ARTICLES]:
+        for entry in feed.entries[: self.MAX_ARTICLES]:
             published_at = None
-            if hasattr(entry, "published_parsed"):
-                published_at = datetime(*entry.published_parsed[:6])
+            if hasattr(entry, "published_parsed") and entry.published_parsed:
+                published_at = to_utc(datetime(*entry.published_parsed[:6]))
 
-            summary = BeautifulSoup(
-                entry.summary, "html.parser"
-            ).get_text(strip=True)
+            summary_html = getattr(entry, "summary", "") or ""
+            summary = BeautifulSoup(summary_html, "html.parser").get_text(strip=True)
 
             result.append(
                 Article(
                     source=self.source,
                     s_type=self.type,
-                    title=entry.title,
+                    title=getattr(entry, "title", "") or "",
                     summary=summary,
                     published_at=published_at,
-                    url=entry.link,
+                    url=getattr(entry, "link", None),
                 )
             )
 
         return result
 
 
-
 class TheVergeParser(SiteParser):
-
     FEED_URL = "https://www.theverge.com/rss/index.xml"
     MAX_ARTICLES = 10
 
@@ -123,34 +107,31 @@ class TheVergeParser(SiteParser):
 
     def parse(self) -> List[Article]:
         feed = feedparser.parse(self.FEED_URL)
-        result = []
+        result: List[Article] = []
 
-        for entry in feed.entries[:self.MAX_ARTICLES]:
+        for entry in feed.entries[: self.MAX_ARTICLES]:
             published_at = None
-            if hasattr(entry, "published_parsed"):
-                published_at = datetime(*entry.published_parsed[:6])
+            if hasattr(entry, "published_parsed") and entry.published_parsed:
+                published_at = to_utc(datetime(*entry.published_parsed[:6]))
 
-            summary = BeautifulSoup(
-                entry.summary, "html.parser"
-            ).get_text(strip=True)
+            summary_html = getattr(entry, "summary", "") or ""
+            summary = BeautifulSoup(summary_html, "html.parser").get_text(strip=True)
 
             result.append(
                 Article(
                     source=self.source,
                     s_type=self.type,
-                    title=entry.title,
+                    title=getattr(entry, "title", "") or "",
                     summary=summary,
                     published_at=published_at,
-                    url=entry.link,
+                    url=getattr(entry, "link", None),
                 )
             )
 
         return result
 
 
-
 class HabrParser(SiteParser):
-
     LIST_URL = "https://habr.com/ru/news/"
     MAX_ARTICLES = 10
 
@@ -158,9 +139,7 @@ class HabrParser(SiteParser):
         super().__init__("https://habr.com/", "ru/news/")
         self.source = "Habr"
         self.type = "site"
-        self.headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; NewsParser/1.0)"
-        }
+        self.headers = {"User-Agent": "Mozilla/5.0 (compatible; NewsParser/1.0)"}
 
     def normalize_url(self, article_id: str):
         if not article_id:
@@ -174,7 +153,7 @@ class HabrParser(SiteParser):
             resp.raise_for_status()
             return resp.text
         except Exception as e:
-            logging.warning(f"HTTP error {url}: {e}")
+            logger.warning("HTTP error %s: %s", url, e)
             return None
 
     def make_soup(self, html: str) -> BeautifulSoup:
@@ -193,7 +172,6 @@ class HabrParser(SiteParser):
             "div",
             class_="article-formatted-body article-formatted-body article-formatted-body_version-2",
         )
-
         if not body:
             return ""
 
@@ -208,10 +186,10 @@ class HabrParser(SiteParser):
         soup = self.make_soup(html)
         container = soup.find("div", class_="tm-articles-list")
         if not container:
-            logging.warning("Habr articles container not found")
+            logger.warning("Habr articles container not found")
             return []
 
-        result = []
+        result: List[Article] = []
         articles = container.find_all("article")
 
         for idx, article in enumerate(articles, start=1):
@@ -232,9 +210,7 @@ class HabrParser(SiteParser):
             time_tag = article.find("time")
             if time_tag and time_tag.get("datetime"):
                 try:
-                    published_at = to_utc(datetime.fromisoformat(
-                        time_tag["datetime"]
-                    ))
+                    published_at = to_utc(datetime.fromisoformat(time_tag["datetime"]))
                 except ValueError:
                     pass
 
@@ -252,94 +228,3 @@ class HabrParser(SiteParser):
             )
 
         return result
-
-
-
-class TelegramParser(SiteParser):
-
-    MAX_MESSAGES = 10
-
-    def __init__(self, channel: str, source: str, api_id: int, api_hash: str):
-        super().__init__("https://t.me/")
-        self.channel = channel
-        self.source = source
-        self.type = "telegram"
-        self.api_id = api_id
-        self.api_hash = api_hash
-
-    def normalize_url(self, msg_id: int):
-        return f"https://t.me/{self.channel}/{msg_id}"
-
-    async def _parse_async(self) -> List[Article]:
-        result = []
-
-        async with TelegramClient(
-            "news_parser", self.api_id, self.api_hash
-        ) as client:
-            async for msg in client.iter_messages(
-                self.channel, limit=self.MAX_MESSAGES
-            ):
-                if not msg.text:
-                    continue
-
-                first_paragraph = msg.text.split("\n\n")[0]
-
-                result.append(
-                    Article(
-                        source=self.source,
-                        s_type=self.type,
-                        title=first_paragraph[:80],
-                        summary=first_paragraph,
-                        published_at=to_utc(msg.date),
-                        url=self.normalize_url(msg.id),
-                    )
-                )
-
-        return result
-
-    def parse(self) -> List[Article]:
-        return asyncio.run(self._parse_async())
-
-
-class WowITeParser(TelegramParser):
-    def __init__(self, api_id, api_hash):
-        super().__init__(
-            channel="wowite",
-            source="WOW IT",
-            api_id=api_id,
-            api_hash=api_hash,
-        )
-
-
-class TechNewsPlusParser(TelegramParser):
-    def __init__(self, api_id, api_hash):
-        super().__init__(
-            channel="technewsplus",
-            source="TechNewsPlus",
-            api_id=api_id,
-            api_hash=api_hash,
-        )
-
-
-
-if __name__ == "__main__":
-
-    parsers = [
-        HabrParser(),
-        TechCrunchParser(),
-        TheVergeParser(),
-    ]
-
-    if TG_API_ID and TG_API_HASH:
-        parsers.extend([WowITeParser(int(TG_API_ID), TG_API_HASH),
-                        TechNewsPlusParser(int(TG_API_ID), TG_API_HASH),
-                        ])
-    else:
-        logging.warning("Telegram parsers disabled (no TG_API_ID / TG_API_HASH)")
-
-    all_articles: List[Article] = []
-
-    for parser in parsers:
-        all_articles.extend(parser.parse())
-
-    pprint([vars(a) for a in all_articles])

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import contextmanager
 from pathlib import Path
 from typing import AsyncGenerator, Generator, Optional
 
@@ -84,9 +84,7 @@ async def init_engines() -> None:
     sync_engine = create_engine(
         sync_url,
         echo=settings.DEBUG,
-        connect_args={"check_same_thread": False}
-        if sync_url.startswith("sqlite")
-        else {},
+        connect_args={"check_same_thread": False} if sync_url.startswith("sqlite") else {},
         poolclass=StaticPool if sync_url.startswith("sqlite") else None,
     )
 
@@ -124,9 +122,7 @@ def init_engines_sync() -> None:
     sync_engine = create_engine(
         sync_url,
         echo=settings.DEBUG,
-        connect_args={"check_same_thread": False}
-        if sync_url.startswith("sqlite")
-        else {},
+        connect_args={"check_same_thread": False} if sync_url.startswith("sqlite") else {},
         poolclass=StaticPool if sync_url.startswith("sqlite") else None,
     )
 
@@ -143,26 +139,30 @@ def init_engines_sync() -> None:
 async def init_db() -> None:
     """Create DB schema (FastAPI startup)."""
     await init_engines()
-    async with async_engine.begin():  # type: ignore[union-attr]
-        await async_engine.run_sync(Base.metadata.create_all)  # type: ignore[union-attr]
+    async with async_engine.begin() as conn:  # type: ignore[union-attr]
+        await conn.run_sync(Base.metadata.create_all)
 
 
 # ================================
 # Session providers
 # ================================
 
-@asynccontextmanager
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    """Async DB session (FastAPI)."""
+    """
+    Async DB session dependency for FastAPI.
+    IMPORTANT: must be an async generator (yield), NOT @asynccontextmanager.
+    """
     if AsyncSessionLocal is None:
         await init_engines()
 
-    async with AsyncSessionLocal() as session:  # type: ignore[misc]
-        try:
-            yield session
-        except Exception:
-            await session.rollback()
-            raise
+    session = AsyncSessionLocal()  # type: ignore[misc]
+    try:
+        yield session
+    except Exception:
+        await session.rollback()
+        raise
+    finally:
+        await session.close()
 
 
 @contextmanager

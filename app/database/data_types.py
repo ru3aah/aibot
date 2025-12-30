@@ -1,12 +1,10 @@
 import uuid
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Annotated
+from typing import Annotated, Optional
 
-from sqlalchemy import String, DateTime, Enum, Text
+from sqlalchemy import DateTime, Enum, String, Text
 from sqlalchemy.orm import mapped_column
-
-from app.database.db import  get_db_sync
 
 
 class PostStatus(StrEnum):
@@ -40,7 +38,6 @@ FK = Annotated[
     ),
 ]
 
-
 URL_REQUIRED = Annotated[
     str,
     mapped_column(
@@ -51,7 +48,7 @@ URL_REQUIRED = Annotated[
 ]
 
 URL_OPTIONAL = Annotated[
-    str,
+    Optional[str],
     mapped_column(
         String,
         nullable=True,
@@ -59,14 +56,13 @@ URL_OPTIONAL = Annotated[
     ),
 ]
 
-
 TextContent = Annotated[
     str,
     mapped_column(Text, nullable=False),
 ]
 
 TextContentOptional = Annotated[
-    str,
+    Optional[str],
     mapped_column(Text, nullable=True),
 ]
 
@@ -81,14 +77,13 @@ TimeStamp = Annotated[
 ]
 
 TimeStampOptional = Annotated[
-    datetime,
+    Optional[datetime],
     mapped_column(
         DateTime(timezone=True),
         nullable=True,
         index=True,
     ),
 ]
-
 
 STATUS = Annotated[
     PostStatus,

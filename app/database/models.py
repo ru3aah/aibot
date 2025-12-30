@@ -2,13 +2,12 @@ from __future__ import annotations
 
 from typing import List
 
-from sqlalchemy import String, Boolean, ForeignKey
+from sqlalchemy import String, Boolean, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from app.database.data_types import (
     PK,
     FK,
-    URL_REQUIRED,
     URL_OPTIONAL,
     TextContent,
     TextContentOptional,
@@ -48,11 +47,15 @@ class Source(Base):
 class NewsItem(Base):
     __tablename__ = "news_items"
 
+    # ВАЖНО: защищает от дублей при параллельных воркерах
+    __table_args__ = (
+        UniqueConstraint("source_id", "url", name="uq_news_source_url"),
+    )
+
     id: Mapped[PK]
 
     title: Mapped[str] = mapped_column(String, nullable=False)
 
-    # In many parsers URL can be absent or malformed. If you require it, switch to URL_REQUIRED.
     url: Mapped[URL_OPTIONAL]
 
     summary: Mapped[TextContent]
@@ -102,13 +105,8 @@ class Post(Base):
 
     status: Mapped[STATUS]
 
-    # Often not known until actually published:
     published_at: Mapped[TimeStampOptional]
-
     created_at: Mapped[TimeStamp]
-
-    # Optional (but recommended): enforce one post per news item per status, etc.
-    # You can add UniqueConstraint in __table_args__ if needed.
 
 
 class Keyword(Base):
