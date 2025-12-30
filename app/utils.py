@@ -1,175 +1,159 @@
 # app/utils.py
 import logging
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional
+from typing import List
 
 from sqlalchemy.orm import Session
 
 from app.database.models import Source, NewsItem
-from app.news_parser.sites import HabrParser, SiteParser
+from app.database.data_types import SourceType
+from app.news_parser.sites import HabrParser, TechCrunchParser, TheVergeParser, SiteParser
 from app.news_parser.telegram import TelegramChannelParser
+
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 
 
-def _now_utc() -> datetime:
+def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def check_duplicate(session: Session, url: str = None, title: str = None) -> bool:
+def check_duplicate(session: Session, url: str | None = None, title: str | None = None) -> bool:
     if url:
-        existing = session.query(NewsItem).filter(NewsItem.url == url).first()
-        if existing:
+        if session.query(NewsItem).filter(NewsItem.url == url).first():
             return True
-
     if title:
-        existing = session.query(NewsItem).filter(NewsItem.title == title).first()
-        if existing:
+        if session.query(NewsItem).filter(NewsItem.title == title).first():
             return True
-
     return False
 
 
-def save_news_items(session: Session, source_id: str, news_items: List[Dict[str, Any]]) -> int:
-    saved_count = 0
+def save_news_items(session: Session, source: Source, items: List[dict]) -> int:
+    saved = 0
 
-    for item_data in news_items:
-        if check_duplicate(
-            session, url=item_data.get("url"), title=item_data.get("title")
-        ):
-            logger.debug("Пропущен дубликат: %s", item_data.get("title", "Без названия"))
+    for item in items:
+        url = item.get("url")
+        title = item.get("title")
+        if check_duplicate(session, url=url, title=title):
+            logger.debug("Дубликат пропущен: %s", title or url)
             continue
+
+        published_at = item.get("published_at") or now_utc()
+        created_at = now_utc()
+
+        # защитимся: если published_at без tzinfo — считаем UTC
+        if isinstance(published_at, datetime) and published_at.tzinfo is None:
+            published_at = published_at.replace(tzinfo=timezone.utc)
 
         try:
-            published_at = item_data.get("published_at") or _now_utc()
-            created_at = _now_utc()
-
-            news_item = NewsItem(
-                title=item_data["title"],
-                url=item_data.get("url"),
-                summary=item_data.get("summary", ""),
-                raw_text=item_data.get("raw_text"),
-                source_id=source_id,
-                published_at=published_at,
-                created_at=created_at,
-            )
-            session.add(news_item)
-            saved_count += 1
-            logger.debug("Добавлена новость: %s", item_data.get("title", "Без названия"))
+            with session.begin_nested():
+                news = NewsItem(
+                    title=title or "Без названия",
+                    url=url,
+                    summary=item.get("summary") or "",
+                    raw_text=item.get("raw_text"),
+                    source_id=source.id,
+                    published_at=published_at,
+                    created_at=created_at,
+                )
+                session.add(news)
+                saved += 1
         except Exception as e:
-            logger.error(
-                "Ошибка при сохранении новости '%s': %s",
-                item_data.get("title", "Без названия"),
-                e,
-                exc_info=True,
-            )
-            continue
+            logger.error("Ошибка сохранения новости '%s': %s", title, e, exc_info=True)
 
-    try:
-        session.commit()
-        logger.info("Сохранено новостей: %s из %s", saved_count, len(news_items))
-    except Exception as e:
-        session.rollback()
-        logger.error("Ошибка при коммите транзакции: %s", e, exc_info=True)
-        raise
+    return saved
 
-    return saved_count
+
+def _pick_site_parser(source: Source) -> SiteParser | None:
+    name = (source.name or "").lower()
+    url = (source.url or "").lower()
+
+    if "habr" in name or "habr.com" in url:
+        return HabrParser()
+    if "techcrunch" in name or "techcrunch.com" in url:
+        return TechCrunchParser()
+    if "theverge" in name or "theverge.com" in url or "the verge" in name:
+        return TheVergeParser()
+
+    return None
 
 
 def parse_site_source(session: Session, source: Source) -> int:
-    source_type = getattr(source, "type", "site")
-    if source_type != "site" or not source.enabled:
+    if source.type != SourceType.SITE or not source.enabled:
         return 0
 
-    try:
-        parser: Optional[SiteParser] = None
-
-        # Сейчас поддерживаем Habr. Остальные — по аналогии добавишь.
-        if "habr" in source.name.lower() or "habr" in (source.url or "").lower():
-            parser = HabrParser()
-        else:
-            logger.warning("Парсер для источника '%s' не найден", source.name)
-            return 0
-
-        logger.info("Парсинг новостей с источника: %s", source.name)
-        articles = parser.parse()
-
-        if not articles:
-            logger.warning("Не найдено новостей с источника: %s", source.name)
-            return 0
-
-        # приводим к словарям
-        payload: List[Dict[str, Any]] = []
-        for a in articles:
-            payload.append(
-                {
-                    "title": a.title,
-                    "url": a.url,
-                    "summary": a.summary,
-                    "raw_text": None,
-                    "published_at": a.published_at or _now_utc(),
-                }
-            )
-
-        saved = save_news_items(session, source.id, payload)
-        logger.info("Источник '%s': сохранено %s новостей", source.name, saved)
-        return saved
-
-    except Exception as e:
-        logger.error("Ошибка при парсинге источника '%s': %s", source.name, e, exc_info=True)
+    parser = _pick_site_parser(source)
+    if not parser:
+        logger.warning("Парсер для site-источника не найден: %s (%s)", source.name, source.url)
         return 0
+
+    logger.info("Парсинг сайта: %s", source.name)
+    articles = parser.parse()
+
+    items = [
+        {
+            "title": a.title,
+            "url": a.url,
+            "summary": a.summary,
+            "published_at": a.published_at,
+            "raw_text": None,
+        }
+        for a in articles
+    ]
+
+    saved = save_news_items(session, source, items)
+    logger.info("Источник '%s': сохранено %s новостей", source.name, saved)
+    return saved
 
 
 def parse_telegram_source(session: Session, source: Source) -> int:
-    """
-    Ожидаем, что у источника Telegram:
-    - source.type == "tg"
-    - source.url содержит @channel или https://t.me/channel или просто channel
-      (можно и name использовать — но лучше url)
-    """
-    source_type = getattr(source, "type", "site")
-    if source_type != "tg" or not source.enabled:
+    if source.type != SourceType.TELEGRAM or not source.enabled:
         return 0
 
+    # канал можно хранить в source.url или source.name — выберем что есть
     channel = (source.url or source.name or "").strip()
     if not channel:
-        logger.warning("TG источник без channel/url: '%s' (%s)", source.name, source.id)
+        logger.warning("TG source без channel/url: %s", source.id)
+        return 0
+
+    # TG_API_ID / TG_API_HASH берём из settings (не из строк 'your_TG_API_ID')
+    if not settings.TG_API_ID or not settings.TG_API_HASH:
+        logger.warning("Telegram парсер не запущен: нет TG_API_ID / TG_API_HASH в .env")
         return 0
 
     try:
-        logger.info("Парсинг Telegram-канала: %s", channel)
-
-        parser = TelegramChannelParser(
-            channel=channel,
-            source_name=source.name or "Telegram",
-            limit=10,
-        )
-        articles = parser.parse()
-
-        if not articles:
-            logger.warning("Не найдено сообщений в Telegram-канале: %s", channel)
-            return 0
-
-        payload: List[Dict[str, Any]] = []
-        for a in articles:
-            payload.append(
-                {
-                    "title": a.title,
-                    "url": a.url,
-                    "summary": a.summary,
-                    "raw_text": None,
-                    "published_at": a.published_at or _now_utc(),
-                }
-            )
-
-        saved = save_news_items(session, source.id, payload)
-        logger.info("Telegram '%s': сохранено %s новостей", source.name, saved)
-        return saved
-
-    except ValueError as e:
-        # нет ключей — это ожидаемо, пока отложили
-        logger.warning("Telegram парсер не запущен: %s", e)
-        return 0
+        api_id = int(settings.TG_API_ID)
+        api_hash = str(settings.TG_API_HASH)
     except Exception as e:
-        logger.error("Ошибка при парсинге Telegram '%s': %s", source.name, e, exc_info=True)
+        logger.warning("Telegram парсер не запущен: TG_API_ID/TG_API_HASH некорректны: %s", e)
         return 0
+
+    session_name = getattr(settings, "TELEGRAM_SESSION_NAME", "aibot_session")
+    limit = 10
+
+    logger.info("Парсинг Telegram-канала: %s", channel)
+    parser = TelegramChannelParser(
+        channel=channel,
+        source_name=source.name,
+        api_id=api_id,
+        api_hash=api_hash,
+        session_name=session_name,
+        limit=limit,
+    )
+
+    articles = parser.parse()
+    items = [
+        {
+            "title": a.title,
+            "url": a.url,
+            "summary": a.summary,
+            "published_at": a.published_at,
+            "raw_text": None,
+        }
+        for a in articles
+    ]
+
+    saved = save_news_items(session, source, items)
+    logger.info("TG источник '%s': сохранено %s сообщений", source.name, saved)
+    return saved

@@ -8,9 +8,6 @@ from datetime import datetime, timezone
 from typing import List, Optional
 
 from telethon import TelegramClient
-from telethon.errors import RPCError
-
-from app.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +23,6 @@ def to_utc(dt: Optional[datetime]) -> Optional[datetime]:
 @dataclass
 class TgArticle:
     source: str
-    type: str  # "tg"
     title: str
     summary: str
     published_at: Optional[datetime]
@@ -35,83 +31,77 @@ class TgArticle:
 
 class TelegramChannelParser:
     """
-    Парсер публичного Telegram-канала через Telethon.
-    Требует TG_API_ID и TG_API_HASH в .env (но код можно подключить заранее).
+    Парсер публичного канала Telegram через Telethon.
+
+    channel:
+      - "somechannel"
+      - "@somechannel"
+      - "https://t.me/somechannel" (тоже поддержим)
     """
 
     def __init__(
         self,
-        channel: str,                   # username или ссылка
-        source_name: str = "Telegram",
+        channel: str,
+        source_name: str,
+        api_id: int,
+        api_hash: str,
+        session_name: str = "aibot_session",
         limit: int = 10,
-        session_name: Optional[str] = None,
     ):
         self.channel = self._normalize_channel(channel)
         self.source_name = source_name
-        self.limit = max(1, min(limit, 100))
-        self.session_name = session_name or settings.TELEGRAM_SESSION_NAME
+        self.api_id = api_id
+        self.api_hash = api_hash
+        self.session_name = session_name
+        self.limit = limit
 
-    def _normalize_channel(self, channel: str) -> str:
+    @staticmethod
+    def _normalize_channel(channel: str) -> str:
         c = (channel or "").strip()
-        if not c:
-            return c
-        # https://t.me/<name> -> <name>
-        if "t.me/" in c:
-            c = c.split("t.me/")[-1]
-        c = c.lstrip("@").strip("/")
+        if c.startswith("https://t.me/"):
+            c = c.replace("https://t.me/", "").strip("/")
+        if c.startswith("@"):
+            c = c[1:]
         return c
 
-    def _message_url(self, msg_id: int) -> Optional[str]:
-        if not self.channel:
-            return None
+    def _message_url(self, msg_id: int) -> str:
         return f"https://t.me/{self.channel}/{msg_id}"
 
     async def _parse_async(self) -> List[TgArticle]:
-        api_id = settings.TG_API_ID
-        api_hash = settings.TG_API_HASH
+        result: List[TgArticle] = []
 
-        if not api_id or not api_hash:
-            raise ValueError("TG_API_ID / TG_API_HASH не заданы в .env")
+        async with TelegramClient(
+            self.session_name,
+            self.api_id,
+            self.api_hash,
+        ) as client:
+            async for msg in client.iter_messages(self.channel, limit=self.limit):
+                text = (msg.text or "").strip()
+                if not text:
+                    continue
 
-        results: List[TgArticle] = []
+                first_para = text.split("\n\n")[0].strip()
+                title = (first_para[:80] + "…") if len(first_para) > 80 else first_para
 
-        async with TelegramClient(self.session_name, int(api_id), api_hash) as client:
-            try:
-                async for msg in client.iter_messages(self.channel, limit=self.limit):
-                    text = (msg.text or "").strip()
-                    if not text:
-                        continue
-
-                    # title = первая строка/абзац, summary = первый абзац
-                    first_line = text.splitlines()[0].strip()
-                    first_paragraph = text.split("\n\n")[0].strip()
-
-                    results.append(
-                        TgArticle(
-                            source=self.source_name,
-                            type="tg",
-                            title=first_line[:120],
-                            summary=first_paragraph[:2000],
-                            published_at=to_utc(msg.date),
-                            url=self._message_url(msg.id),
-                        )
+                result.append(
+                    TgArticle(
+                        source=self.source_name,
+                        title=title,
+                        summary=first_para,
+                        published_at=to_utc(getattr(msg, "date", None)),
+                        url=self._message_url(msg.id),
                     )
-            except RPCError as e:
-                logger.error("Telethon RPC error for channel '%s': %s", self.channel, e, exc_info=True)
-                return []
-            except Exception as e:
-                logger.error("Unexpected TG parse error for channel '%s': %s", self.channel, e, exc_info=True)
-                return []
+                )
 
-        return results
+        return result
 
     def parse(self) -> List[TgArticle]:
         """
-        Синхронная обёртка для Celery / обычного кода.
+        В Celery-процессе часто нет running loop — asyncio.run ок.
+        Если loop уже есть — создаём задачу в нём.
         """
         try:
             return asyncio.run(self._parse_async())
         except RuntimeError:
-            # если вдруг уже есть event loop (редко для Celery, но на всякий)
             loop = asyncio.get_event_loop()
             return loop.run_until_complete(self._parse_async())

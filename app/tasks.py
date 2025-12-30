@@ -4,7 +4,6 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
-from app.ai.generator import generate_posts
 from celery_worker import celery_app
 from app.database.data_types import PostStatus, SourceType
 from app.database.db import get_db_sync
@@ -14,13 +13,8 @@ from app.utils import parse_site_source, parse_telegram_source
 logger = logging.getLogger(__name__)
 
 
-def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-
 @celery_app.task(name="app.tasks.parse_news", bind=True, max_retries=3)
 def parse_news(self):
-    """Парсит новости из всех активных источников и сохраняет их в БД."""
     logger.info("Начало парсинга новостей…")
 
     try:
@@ -34,6 +28,7 @@ def parse_news(self):
             logger.info("Найдено активных источников: %s", len(sources))
 
             total_saved = 0
+
             for source in sources:
                 try:
                     if source.type == SourceType.SITE:
@@ -41,22 +36,13 @@ def parse_news(self):
                     elif source.type == SourceType.TELEGRAM:
                         saved = parse_telegram_source(session, source)
                     else:
-                        logger.warning(
-                            "Неизвестный тип источника %s для '%s'",
-                            source.type,
-                            source.name,
-                        )
+                        logger.warning("Неизвестный тип источника %s для '%s'", source.type, source.name)
                         saved = 0
 
                     total_saved += int(saved or 0)
 
                 except Exception as e:
-                    logger.error(
-                        "Ошибка при обработке источника '%s': %s",
-                        source.name,
-                        e,
-                        exc_info=True,
-                    )
+                    logger.error("Ошибка при обработке источника '%s': %s", source.name, e, exc_info=True)
                     session.rollback()
                     continue
 
@@ -66,11 +52,7 @@ def parse_news(self):
                 logger.info("Запускаем генерацию постов после парсинга")
                 generate_posts_task.delay()
 
-            return {
-                "status": "success",
-                "saved": total_saved,
-                "sources_processed": len(sources),
-            }
+            return {"status": "success", "saved": total_saved, "sources_processed": len(sources)}
 
     except Exception as e:
         logger.error("Критическая ошибка при парсинге новостей: %s", e, exc_info=True)
@@ -79,10 +61,15 @@ def parse_news(self):
 
 @celery_app.task(name="app.tasks.generate_posts", bind=True, max_retries=3)
 def generate_posts_task(self):
-    """Генерирует посты для новостей, у которых ещё нет Post."""
+    """
+    Генерация постов остаётся, но если OpenAI ключ не задан — это не должно валить воркер.
+    """
     logger.info("Выполняем задачу генерации постов по новостям")
 
     try:
+        # импорт внутри, чтобы воркер мог стартовать даже без OpenAI
+        from app.ai.generator import generate_post_text
+
         with get_db_sync() as session:  # type: Session
             news_without_posts = (
                 session.query(NewsItem)
@@ -96,10 +83,9 @@ def generate_posts_task(self):
                 return {"status": "success", "generated": 0}
 
             generated_count = 0
-
             for news_item in news_without_posts:
                 try:
-                    post_text = generate_posts(news_item)
+                    post_text = generate_post_text(news_item)
 
                     session.add(
                         Post(
@@ -107,7 +93,7 @@ def generate_posts_task(self):
                             generated_text=post_text,
                             status=PostStatus.GENERATED if post_text else PostStatus.FAILED,
                             published_at=None,
-                            created_at=_now_utc(),
+                            created_at=datetime.now(timezone.utc),
                         )
                     )
 
@@ -118,19 +104,14 @@ def generate_posts_task(self):
                         logger.warning("Не удалось сгенерировать пост для новости %s", news_item.id)
 
                 except Exception as e:
-                    logger.error(
-                        "Ошибка при генерации поста для новости %s: %s",
-                        news_item.id,
-                        e,
-                        exc_info=True,
-                    )
+                    logger.error("Ошибка при генерации поста для новости %s: %s", news_item.id, e, exc_info=True)
                     session.add(
                         Post(
                             news_id=news_item.id,
                             generated_text=None,
                             status=PostStatus.FAILED,
                             published_at=None,
-                            created_at=_now_utc(),
+                            created_at=datetime.now(timezone.utc),
                         )
                     )
 

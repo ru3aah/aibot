@@ -1,3 +1,4 @@
+# app/ai/generator.py
 import logging
 
 from app.ai.openai_client import make_request
@@ -6,38 +7,32 @@ from app.database.models import NewsItem
 logger = logging.getLogger(__name__)
 
 INSTRUCTIONS = """
-Вы — профессиональный новостной редактор.
-Сделай краткий, интересный пост для Telegram по новости: добавь emoji, суть, и один call-to-action.
-Тон: живой, но без кликбейта. 1–3 абзаца, до ~700 знаков.
+Вы — редактор Telegram-канала.
+Сделай краткое, интересное описание новости для Telegram-поста:
+- 1–3 предложения
+- 1–2 emoji
+- лёгкий call to action
 """
 
 
 def generate_post_text(news: NewsItem) -> str | None:
     source_name = None
     try:
-        # relationship Source (если selectin сработал)
-        if getattr(news, "source", None) is not None:
-            source_name = getattr(news.source, "name", None)
+        source_name = news.source.name if news.source else None
     except Exception:
         source_name = None
 
-    if not source_name:
-        source_name = news.source_id
-
     prompt = f"""
 Новость: {news.title}
-
-Краткое содержание:
-{news.summary}
-
-Источник: {source_name}
+Содержание: {news.summary}
+Источник: {source_name or "unknown"}
 """
 
     logger.info("Генерация поста для новости: %s", news.id)
-    text = make_request(INSTRUCTIONS, prompt)
+    post_text = make_request(INSTRUCTIONS, prompt)
 
-    if not text:
+    if not post_text:
         logger.warning("OpenAI вернул пустой результат для новости %s", news.id)
         return None
 
-    return text
+    return post_text.strip()

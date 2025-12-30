@@ -1,3 +1,4 @@
+# app/ai/openai_client.py
 import logging
 
 from openai import OpenAI, RateLimitError, OpenAIError
@@ -6,14 +7,11 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 
-def _build_client() -> OpenAI | None:
-    api_key = settings.OPENAI_API_KEY
-    if not api_key:
+def _get_client() -> OpenAI | None:
+    key = getattr(settings, "OPEN_AI_API_KEY", None)
+    if not key:
         return None
-    return OpenAI(api_key=api_key)
-
-
-client: OpenAI | None = _build_client()
+    return OpenAI(api_key=key)
 
 
 def make_request(
@@ -22,24 +20,19 @@ def make_request(
     temperature: float = 0.7,
     max_tokens: int = 500,
 ) -> str | None:
-    """
-    Возвращает сгенерированный текст или None.
-    """
-    if not settings.OPENAI_API_KEY:
-        logger.error("OPENAI_API_KEY is not set (check .env)")
+    client = _get_client()
+    if not client:
+        logger.warning("OPEN_AI_API_KEY не задан — генерация пропущена")
         return None
 
-    if not settings.OPENAI_MODEL:
-        logger.error("OPENAI_MODEL is not set (check .env)")
+    model = getattr(settings, "OPEN_AI_MODEL", None)
+    if not model:
+        logger.warning("OPEN_AI_MODEL не задан — генерация пропущена")
         return None
-
-    global client
-    if client is None:
-        client = _build_client()
 
     try:
         response = client.responses.create(
-            model=settings.OPENAI_MODEL,
+            model=model,
             instructions=instructions,
             input=prompt,
             temperature=temperature,
@@ -48,14 +41,11 @@ def make_request(
         return response.output_text
 
     except RateLimitError as e:
-        logger.error("OpenAI rate limit: %s", e)
+        logger.error("Rate limit error: %s", e)
         return None
-
     except OpenAIError as e:
-        # сюда попадёт и 401 invalid_api_key, и прочие ошибки API
         logger.error("OpenAI API error: %s", e)
         return None
-
     except Exception as e:
-        logger.exception("Unexpected OpenAI client error: %s", e)
+        logger.error("OpenAI unknown error: %s", e, exc_info=True)
         return None
