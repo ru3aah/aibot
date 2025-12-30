@@ -31,9 +31,7 @@ class Source(Base):
 
     name: Mapped[str] = mapped_column(String, nullable=False, index=True)
 
-    # Choose required/optional depending on your business rules.
-    # Typically a source has a URL, so required makes sense:
-    url: Mapped[URL_REQUIRED]
+    url: Mapped[URL_OPTIONAL]
 
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 

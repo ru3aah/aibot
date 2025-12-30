@@ -6,10 +6,12 @@ from typing import Annotated
 from sqlalchemy import String, DateTime, Enum, Text
 from sqlalchemy.orm import mapped_column
 
+from app.database.db import  get_db_sync
+
 
 class PostStatus(StrEnum):
     NEW = "new"
-    DRAFT = "generated"
+    GENERATED = "generated"
     PUBLISHED = "published"
     FAILED = "failed"
 

@@ -3,4 +3,5 @@
 .idea
 *.db
 __pycash__
-venv
+
+/celerybeat-schedule
