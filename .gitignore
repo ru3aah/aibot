@@ -16,3 +16,11 @@ __pycash__
 # celery beat schedule
 celerybeat-schedule
 celerybeat-schedule.db
+/app.db.bak_*
+/tg_test.py
+/tg_login.py
+/f86842b8ae43f8cd852436ceaa620f7c.session
+/alembic/script.py.mako
+/aibot.session
+/alembic/versions/
+/aibot.session
