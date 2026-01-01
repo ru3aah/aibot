@@ -4,8 +4,8 @@ version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.13"
 dependencies = [
+    "aiogram>=3.23.0",
     "aiosqlite>=0.22.1",
-    "alembic>=1.17.2",
     "asyncpg>=0.31.0",
     "beautifulsoup4>=4.14.3",
     "black>=25.12.0",

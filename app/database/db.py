@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import contextmanager
 from pathlib import Path
 from typing import AsyncGenerator, Generator, Optional
@@ -13,6 +14,8 @@ from sqlalchemy.pool import StaticPool
 
 from app.config import settings
 from app.database.models import Base
+
+logger = logging.getLogger(__name__)
 
 # ================================
 # Globals
@@ -42,6 +45,18 @@ def _ensure_sqlite_dir(db_url: str) -> None:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
 
+def _sqlite_forced_sync_url() -> str:
+    """
+    ВАЖНО: когда мы не можем await settings.choose_base_url() (например внутри running event loop),
+    мы всё равно должны использовать тот же sqlite-файл, что и в choose_base_url().
+    """
+    # choose_base_url() внутри себя делает _sqlite_force_into_app_database()
+    # Повторим этот же путь синхронно.
+    forced = settings._sqlite_force_into_app_database(settings.SQLITE_URL)  # type: ignore[attr-defined]
+    url = make_url(str(forced))
+    return str(url.set(drivername="sqlite"))
+
+
 # ================================
 # Engines init
 # ================================
@@ -65,6 +80,9 @@ async def init_engines() -> None:
 
     _ensure_sqlite_dir(async_url)
     _ensure_sqlite_dir(sync_url)
+
+    logger.info("DB async_url=%s", async_url)
+    logger.info("DB sync_url=%s", sync_url)
 
     async_engine = create_async_engine(
         async_url,
@@ -93,7 +111,7 @@ async def init_engines() -> None:
 def init_engines_sync() -> None:
     """
     Initialize sync engine/session for contexts that can't await
-    (Celery, CLI scripts, etc.)
+    (Celery, CLI scripts, aiogram handlers, etc.)
     """
     global sync_engine, SessionLocal
 
@@ -102,18 +120,21 @@ def init_engines_sync() -> None:
 
     try:
         base_url = asyncio.run(settings.choose_base_url())
+        url = make_url(str(base_url))
+        if url.drivername.startswith("sqlite"):
+            sync_url = str(url.set(drivername="sqlite"))
+        else:
+            sync_url = str(url.set(drivername="postgresql+psycopg"))
+
     except RuntimeError:
-        # fallback if event loop already running
-        base_url = settings.SQLITE_URL
-
-    url = make_url(str(base_url))
-
-    if url.drivername.startswith("sqlite"):
-        sync_url = str(url.set(drivername="sqlite"))
-    else:
-        sync_url = str(url.set(drivername="postgresql+psycopg"))
+        # running event loop (aiogram и т.п.)
+        # ВАЖНО: не используем settings.SQLITE_URL напрямую (sqlite:///aibot.db),
+        # а форсим тот же путь, что выбирается в choose_base_url() -> app/database/aibot.db
+        sync_url = _sqlite_forced_sync_url()
 
     _ensure_sqlite_dir(sync_url)
+
+    logger.info("DB sync_url=%s", sync_url)
 
     sync_engine = create_engine(
         sync_url,
@@ -144,10 +165,7 @@ async def init_db() -> None:
 # ================================
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    """
-    Async DB session dependency for FastAPI.
-    IMPORTANT: must be an async generator (yield), NOT @asynccontextmanager.
-    """
+    """Async DB session dependency for FastAPI."""
     if AsyncSessionLocal is None:
         await init_engines()
 
@@ -163,7 +181,7 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 @contextmanager
 def get_db_sync() -> Generator[Session, None, None]:
-    """Sync DB session (Celery, background jobs)."""
+    """Sync DB session (Celery, background jobs, aiogram handlers)."""
     if SessionLocal is None:
         init_engines_sync()
 

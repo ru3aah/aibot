@@ -1,36 +1,54 @@
 import platform
+from datetime import timedelta
 
 from celery import Celery
 from app.config import settings
 
 celery_app = Celery(
-    'aibot',
+    "aibot",
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
-    include=['app.tasks']
+    include=["app.tasks"],
 )
 
-celery_app.conf.update(
-    task_serializer='json',
-    accept_content=['json'],
-    result_serializer='json',
-    task_default_queue='aibot',
-    task_routes={
-        'app.tasks.parse_news': {
-            'queue': 'aibot',
-        },
+# Базовая конфигурация Celery + Beat
+conf: dict = {
+    # сериализация
+    "task_serializer": "json",
+    "accept_content": ["json"],
+    "result_serializer": "json",
+
+    # очереди
+    "task_default_queue": "aibot",
+    "task_routes": {
+        "app.tasks.parse_news": {"queue": "aibot"},
+        "app.tasks.generate_chain_post": {"queue": "aibot"},
+        "app.tasks.publish_latest_post": {"queue": "aibot"},
     },
-    task_acks_late=True,
-    task_time_limit=30,
-    task_soft_time_limit=25,
-    timezone='Europe/Madrid',
-    enable_utc=True,
-    worker_pool='solo' if platform.system() == 'Windows' else 'prefork',
-    worker_concurrency=1 if platform.system() == 'Windows' else None,
-    beat_schedule={
-        'parse_news': {
-            'task': 'app.tasks.parse_news',
-            'schedule': settings.PARSE_INTERVAL_MINUTES * 60,
+
+    # надёжность
+    "task_acks_late": True,
+    "task_time_limit": 30,
+    "task_soft_time_limit": 25,
+
+    # таймзона
+    "timezone": "Europe/Madrid",
+    "enable_utc": True,
+
+    # Celery Beat (период берём строго из .env)
+    "beat_schedule": {
+        "parse_news": {
+            "task": "app.tasks.parse_news",
+            "schedule": timedelta(
+                minutes=int(settings.PARSE_INTERVAL_MINUTES)
+            ),
         }
-    }
-)
+    },
+}
+
+# Для Windows Celery стабильнее в single-process режиме
+if platform.system() == "Windows":
+    conf["worker_pool"] = "solo"
+    conf["worker_concurrency"] = 1
+
+celery_app.conf.update(**conf)
