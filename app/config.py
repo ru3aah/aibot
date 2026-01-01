@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     CLAIM_TTL_MINUTES: int = 25
 
     #post publish batch max size
-    PUBLISH_BATCH_LIMIT: int = 5
+    PUBLISH_BATCH_LIMIT: int = 1
 
     DEBUG: bool = True
 

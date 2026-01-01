@@ -1,390 +1,524 @@
 import json
 import logging
 import uuid
+import hashlib
 from datetime import datetime, timedelta, timezone
-from typing import List, Sequence
+from typing import Any, Dict, List, Optional
+
+from sqlalchemy import text
+from sqlalchemy.orm import Session
 
 from celery_worker import celery_app
 from app.config import settings
 from app.database.db import get_db_sync
-from app.database.models import Keyword, NewsItem, Post, Source, FilterSettings
-from app.database.data_types import PostStatus, SourceType
-from app.ai.generator import generate_chain_post
-from app.utils import parse_site_source, parse_telegram_source
+from app.database.models import NewsItem, Post, PostStatus, Source
+from app.telegram.publisher import TelegramPublisher
+
 
 logger = logging.getLogger(__name__)
 
-# Маркер "захвата" поста на публикацию (чтобы не было дублей при параллельных publish)
-CLAIM_PREFIX = "CLAIM:"
 
+# ----------------------------
+# Time helpers
+# ----------------------------
 
-def now_utc() -> datetime:
+def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def chain_len() -> int:
-    return settings.PARSE_THREADS
+# ----------------------------
+# FilterSettings (raw SQL, tolerant to schema drift)
+# ----------------------------
 
-
-def _normalize(s: str) -> str:
-    return (s or "").strip().lower()
-
-
-def _dedupe_news(items: Sequence[NewsItem]) -> List[NewsItem]:
+def _get_filter_settings_row(session: Session) -> Optional[Dict[str, Any]]:
     """
-    Дедупликация:
-    1) по url (если есть)
-    2) иначе по title
-    Сохраняем порядок.
+    Read latest filter_settings row via raw SQL to avoid ORM mismatch.
+    Expected columns (as per your PRAGMA): id, language, updated_at, active_keywords_json
     """
-    seen_url = set()
-    seen_title = set()
-    out: List[NewsItem] = []
+    row = session.execute(
+        text(
+            """
+            SELECT id, language, updated_at, active_keywords_json
+            FROM filter_settings
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """
+        )
+    ).mappings().first()
 
-    for n in items:
-        url = _normalize(getattr(n, "url", "") or "")
-        title = _normalize(getattr(n, "title", "") or "")
-
-        if url:
-            if url in seen_url:
-                continue
-            seen_url.add(url)
-            out.append(n)
-            continue
-
-        if title:
-            if title in seen_title:
-                continue
-            seen_title.add(title)
-            out.append(n)
-            continue
-
-        out.append(n)
-
-    return out
+    return dict(row) if row else None
 
 
-def _get_filter_settings(session) -> FilterSettings:
-    """
-    Возвращает единственную запись FilterSettings.
-    Если её нет — создаёт (id='1').
-    """
-    fs = session.query(FilterSettings).order_by(FilterSettings.updated_at.desc()).first()
-    if fs:
-        return fs
-
-    fs = FilterSettings(
-        id="1",
-        language="ru",
-        active_keywords_json="[]",
-        updated_at=now_utc(),
-    )
-    session.add(fs)
-    session.commit()
-    return fs
-
-
-def _load_active_keywords(session) -> List[str]:
-    """
-    Возвращает список АКТИВНЫХ ключевых слов (lowercase) из filter_settings.active_keywords_json.
-    Если список пуст — значит фильтрацию не применяем.
-    """
-    fs = _get_filter_settings(session)
-
-    raw = (fs.active_keywords_json or "").strip()
-    if not raw:
+def _load_active_keywords(session: Session) -> List[str]:
+    fs = _get_filter_settings_row(session)
+    if not fs:
         return []
 
+    raw = fs.get("active_keywords_json") or ""
     try:
-        data = json.loads(raw)
+        data = json.loads(raw) if raw else []
         if not isinstance(data, list):
             return []
+        out: List[str] = []
+        seen = set()
+        for x in data:
+            if not isinstance(x, str):
+                continue
+            s = x.strip().lower()
+            if not s:
+                continue
+            if s in seen:
+                continue
+            seen.add(s)
+            out.append(s)
+        return out
     except Exception:
         return []
 
-    kws: List[str] = []
-    for w in data:
-        if not isinstance(w, str):
-            continue
-        w = w.strip()
-        if len(w) >= 2:
-            kws.append(w.lower())
 
-    # На всякий случай ограничим, даже если в БД больше
-    return kws[:5]
+def _load_selected_language(session: Session, default: str = "ru") -> str:
+    fs = _get_filter_settings_row(session)
+    if not fs:
+        return default
+    lang = (fs.get("language") or default).strip().lower()
+    return lang or default
 
 
-def _matches_keywords(n: NewsItem, keywords_lc: Sequence[str]) -> bool:
+def _filter_signature(language: str, keywords_lc: List[str]) -> str:
     """
-    Проверяем вхождение любого ключевого слова в текстовые поля.
+    Stable signature for current settings to bind generated posts to active filters.
+    No DB migrations: we store it in Post.input_key prefix.
     """
+    lang = (language or "ru").strip().lower()
+    kws = [k.strip().lower() for k in (keywords_lc or []) if k and k.strip()]
+    kws_sorted = sorted(set(kws))
+    payload = f"lang={lang}|kw={'|'.join(kws_sorted)}"
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+
+
+# ----------------------------
+# News filtering
+# ----------------------------
+
+def _matches_keywords(item: NewsItem, keywords_lc: List[str]) -> bool:
     if not keywords_lc:
         return True
 
-    hay = " ".join(
-        [
-            _normalize(getattr(n, "title", "") or ""),
-            _normalize(getattr(n, "summary", "") or ""),
-            _normalize(getattr(n, "raw_text", "") or ""),
-            _normalize(getattr(n, "text100", "") or ""),
-        ]
-    )
+    parts = [
+        (item.title or ""),
+        (item.summary or ""),
+        (item.raw_text or ""),
+        (item.text100 or ""),
+        (item.url or ""),
+    ]
+    hay = " ".join(parts).lower()
 
-    if not hay.strip():
-        return False
+    for kw in keywords_lc:
+        if kw in hay:
+            return True
+    return False
 
-    return any(kw in hay for kw in keywords_lc)
+
+def _dedupe_news(items: List[NewsItem]) -> List[NewsItem]:
+    seen_url = set()
+    seen_title = set()
+    out: List[NewsItem] = []
+    for n in items:
+        url = (n.url or "").strip().lower()
+        title = (n.title or "").strip().lower()
+
+        if url and url in seen_url:
+            continue
+        if title and title in seen_title:
+            continue
+
+        if url:
+            seen_url.add(url)
+        if title:
+            seen_title.add(title)
+
+        out.append(n)
+    return out
 
 
-def _filter_news(session, items: Sequence[NewsItem]) -> List[NewsItem]:
+def _filter_news_strict(session: Session, raw_news: List[NewsItem]) -> List[NewsItem]:
     """
-    1) дедуп
-    2) фильтрация по активным keywords из filter_settings (если они есть)
+    STRICT MODE:
+    - if keywords are active and there are 0 matches -> return []
+      (generation must be skipped, no "берём без фильтра")
     """
-    deduped = _dedupe_news(items)
-
     keywords_lc = _load_active_keywords(session)
-    if not keywords_lc:
-        logger.info("active_keywords: пусто -> фильтрацию не применяем")
-        return list(deduped)
 
-    filtered = [n for n in deduped if _matches_keywords(n, keywords_lc)]
+    if not keywords_lc:
+        return raw_news
+
+    filtered = [n for n in raw_news if _matches_keywords(n, keywords_lc)]
     logger.info(
         "active_keywords: применили фильтр (%d слов) -> %d/%d новостей прошло",
         len(keywords_lc),
         len(filtered),
-        len(deduped),
+        len(raw_news),
     )
+
+    if not filtered:
+        logger.warning("active_keywords: совпадений 0 -> строгий режим, генерацию пропускаем")
+        return []
+
     return filtered
 
 
-def _is_claim(mid: str | None) -> bool:
-    return bool(mid) and str(mid).startswith(CLAIM_PREFIX)
+# ----------------------------
+# Redis lock helpers
+# ----------------------------
+
+_LOCK_KEY = "aibot:publish_lock"
 
 
-def _claim_post_for_publish(session, post_id: str) -> str | None:
-    """
-    Атомарно "захватываем" пост на публикацию.
-    Перед отправкой в TG пишем telegram_message_id="CLAIM:<uuid>".
-    """
-    claim_id = f"{CLAIM_PREFIX}{uuid.uuid4()}"
-    updated = (
-        session.query(Post)
-        .filter(
-            Post.id == post_id,
-            Post.status == PostStatus.GENERATED,
-            Post.telegram_message_id.is_(None),
-        )
-        .update(
-            {Post.telegram_message_id: claim_id},
-            synchronize_session=False,
-        )
-    )
-    if updated:
-        return claim_id
+def _get_redis_url() -> Optional[str]:
+    for attr in ("REDIS_URL", "CELERY_BROKER_URL", "BROKER_URL"):
+        url = getattr(settings, attr, None)
+        if url:
+            return str(url)
     return None
 
 
-def _cleanup_stuck_claims(session) -> int:
+def _acquire_publish_lock(ttl_seconds: int = 60) -> Optional[str]:
     """
-    Снимает "залипшие" CLAIM у GENERATED постов по TTL.
-    Основание: created_at слишком старый + telegram_message_id LIKE 'CLAIM:%'
+    Returns lock token if acquired, else None.
+    Uses SET NX EX.
     """
-    ttl = getattr(settings, "CLAIM_TTL_MINUTES", 25)
-    deadline = now_utc() - timedelta(minutes=int(ttl))
+    redis_url = _get_redis_url()
+    if not redis_url:
+        logger.warning("publish lock: REDIS url not found in settings, lock disabled")
+        return "NOLOCK"
 
-    updated = (
-        session.query(Post)
-        .filter(
-            Post.status == PostStatus.GENERATED,
-            Post.telegram_message_id.like(f"{CLAIM_PREFIX}%"),
-            Post.created_at < deadline,
-        )
-        .update(
-            {Post.telegram_message_id: None},
-            synchronize_session=False,
-        )
-    )
-    return int(updated or 0)
+    try:
+        import redis  # type: ignore
+        r = redis.Redis.from_url(redis_url)
+        token = str(uuid.uuid4())
+        ok = r.set(_LOCK_KEY, token, nx=True, ex=ttl_seconds)
+        if ok:
+            return token
+        return None
+    except Exception as e:
+        logger.warning("publish lock: failed to use redis (%s), lock disabled", e)
+        return "NOLOCK"
 
+
+def _release_publish_lock(token: Optional[str]) -> None:
+    if not token or token == "NOLOCK":
+        return
+
+    redis_url = _get_redis_url()
+    if not redis_url:
+        return
+
+    try:
+        import redis  # type: ignore
+        r = redis.Redis.from_url(redis_url)
+
+        script = """
+        if redis.call("GET", KEYS[1]) == ARGV[1] then
+            return redis.call("DEL", KEYS[1])
+        else
+            return 0
+        end
+        """
+        r.eval(script, 1, _LOCK_KEY, token)
+    except Exception:
+        pass
+
+
+# ----------------------------
+# Celery task: parse_news
+# ----------------------------
 
 @celery_app.task(name="app.tasks.parse_news")
-def parse_news():
+def parse_news() -> Dict[str, Any]:
+    from app.news_parser.runner import parse_all_sources  # existing runner
+
     with get_db_sync() as session:
         sources = session.query(Source).filter(Source.enabled.is_(True)).all()
 
-        for source in sources:
-            if source.type == SourceType.SITE:
-                parse_site_source(session, source)
-            elif source.type == SourceType.TG:
-                parse_telegram_source(session, source)
+    result = parse_all_sources(sources)
+    return {"status": "ok", "parsed": getattr(result, "parsed", None) or result}
 
-        session.commit()
 
-    # основная цепочка: parse -> generate -> publish
-    celery_app.send_task("app.tasks.generate_chain_post", queue="aibot")
-
+# ----------------------------
+# Celery task: generate_chain_post
+# ----------------------------
 
 @celery_app.task(name="app.tasks.generate_chain_post")
-def generate_chain_post_task():
+def generate_chain_post_task() -> Dict[str, Any]:
+    from app.ai.generator import generate_chain_post  # existing generator
+
     with get_db_sync() as session:
-        # берём окно побольше, чтобы после фильтрации осталось что генерировать
-        raw_limit = max(chain_len() * 3, chain_len())
-        raw_news = (
+        window = max(int(getattr(settings, "PARSE_THREADS", 10)) * 3, 30)
+
+        raw_news: List[NewsItem] = (
             session.query(NewsItem)
             .order_by(NewsItem.created_at.desc())
-            .limit(raw_limit)
+            .limit(window)
             .all()
         )
 
-        # порядок: старые -> новые
-        raw_news = list(reversed(raw_news))
-        if not raw_news:
-            logger.info("Нет новостей для генерации")
-            return {"status": "empty", "generated": 0}
+        raw_news = _dedupe_news(raw_news)
 
-        filtered = _filter_news(session, raw_news)
+        # settings
+        lang = _load_selected_language(session, default="ru")
+        keywords_lc = _load_active_keywords(session)
 
-        # если фильтр выкинул всё — не блокируем пайплайн
+        # strict keyword filter
+        filtered = _filter_news_strict(session, raw_news)
+
         if not filtered:
-            logger.warning("Фильтрация выкинула все новости -> берём без фильтра")
-            filtered = raw_news
+            sig = _filter_signature(lang, keywords_lc)
 
-        # ограничиваем итоговую длину цепочки (старые -> новые)
-        news = filtered[-chain_len():]
+            # human message (for bot UI)
+            kw_display = ", ".join(keywords_lc) if keywords_lc else "—"
+            msg = f"⚠️ По выбранным ключевым словам новостей нет: {kw_display}"
 
-        text, status, error, ids_json, key = generate_chain_post(news)
+            # explicit warning in worker logs
+            logger.warning(
+                "no_news_for_active_keywords: lang=%s keywords=%s sig=%s",
+                lang,
+                keywords_lc,
+                sig,
+            )
+
+            return {
+                "status": "skipped",
+                "reason": "no_news_for_active_keywords",
+                "message": msg,
+                "generated": 0,
+                "post_status": None,
+                "has_text": False,
+                "post_id": None,
+                "language": lang,
+                "keywords": keywords_lc,
+                "filter_sig": sig,
+            }
+
+        limit_n = max(int(getattr(settings, "PARSE_THREADS", 10)), 1)
+        selected_news = filtered[:limit_n]
+
+        # bind post to current filters
+        sig = _filter_signature(lang, keywords_lc)
+
+        generated_text = generate_chain_post(selected_news, language=lang)
+        has_text = bool(generated_text and str(generated_text).strip())
+
+        # input_key keeps compatibility, but now has a prefix with signature
+        # This lets publish pick ONLY posts created under current (lang+keywords).
+        legacy_key = "-".join([n.id[:6] for n in selected_news])
+        input_key = f"F:{sig}:{legacy_key}"
 
         post = Post(
-            generated_text=text,
-            status=status if status else PostStatus.FAILED,
-            created_at=now_utc(),
-            error=error,
-            input_news_ids=ids_json,
-            input_key=key,
+            id=str(uuid.uuid4()),
+            news_id=None,
+            generated_text=generated_text if has_text else "",
+            status=PostStatus.GENERATED,
+            published_at=None,
+            created_at=_utcnow(),
+            telegram_message_id=None,
+            error=None,
+            input_news_ids=json.dumps([n.id for n in selected_news], ensure_ascii=False),
+            input_key=input_key,
         )
 
         session.add(post)
         session.commit()
 
-        # основная логика: сразу после генерации пытаемся публиковать
-        celery_app.send_task("app.tasks.publish_latest_post", queue="aibot")
-
         return {
             "status": "success",
             "generated": 1,
             "post_status": str(post.status),
-            "has_text": bool(post.generated_text),
-            "post_id": str(post.id),
+            "has_text": has_text,
+            "post_id": post.id,
+            "language": lang,
+            "keywords": keywords_lc,
+            "filter_sig": sig,
+            "news_count": len(selected_news),
         }
 
 
+# ----------------------------
+# Celery task: publish_latest_post
+# ----------------------------
+
 @celery_app.task(name="app.tasks.publish_latest_post")
-def publish_latest_post_task():
+def publish_latest_post() -> Dict[str, Any]:
     """
-    Публикует пачку постов GENERATED (FIFO), максимум settings.PUBLISH_BATCH_LIMIT за прогон.
-
-    Защита от дублей:
-    - claim в telegram_message_id="CLAIM:<uuid>"
-
-    Дополнительно:
-    - авто-снятие "залипших" CLAIM по TTL (settings.CLAIM_TTL_MINUTES)
+    Publishes максимум 1 пост за запуск.
+    - clears stuck CLAIM by TTL (CLAIM_TTL_MINUTES)
+    - Redis-lock prevents parallel publish
+    - publishes only posts matching CURRENT filter signature (lang+keywords)
+      (prevents publishing old/unfiltered backlog)
     """
-    from app.telegram.publisher import TelegramPublisher  # локальный импорт, чтобы избежать циклов
+    batch_limit = int(getattr(settings, "PUBLISH_BATCH_LIMIT", 5))
+    claim_ttl_min = int(getattr(settings, "CLAIM_TTL_MINUTES", 25))
 
-    published = 0
-    skipped = 0
-    retryable = 0
-    failed_empty = 0
-    claimed_elsewhere = 0
+    effective_limit = 1  # force single publish per run
 
-    batch_limit = getattr(settings, "PUBLISH_BATCH_LIMIT", 5)
+    lock_token: Optional[str] = None
+    try:
+        lock_token = _acquire_publish_lock(ttl_seconds=90)
+        if lock_token is None:
+            return {
+                "status": "skipped",
+                "reason": "locked",
+                "published": 0,
+                "claimed_elsewhere": 0,
+                "retryable": 0,
+                "failed_empty": 0,
+                "batch_limit": batch_limit,
+                "effective_limit": effective_limit,
+            }
 
-    with get_db_sync() as session:
-        # 0) чистим залипшие claim
-        cleared = _cleanup_stuck_claims(session)
-        if cleared:
-            logger.warning("publish: cleared stuck CLAIM=%d", cleared)
+        with get_db_sync() as session:
+            # compute current signature
+            lang = _load_selected_language(session, default="ru")
+            keywords_lc = _load_active_keywords(session)
+            sig = _filter_signature(lang, keywords_lc)
+            prefix = f"F:{sig}:"
+
+            # 1) clear stuck claims
+            cutoff = _utcnow() - timedelta(minutes=claim_ttl_min)
+            cleared = (
+                session.query(Post)
+                .filter(
+                    Post.status == PostStatus.GENERATED,
+                    Post.telegram_message_id.like("CLAIM:%"),
+                    Post.created_at < cutoff,
+                )
+                .update({Post.telegram_message_id: None}, synchronize_session=False)
+            )
+            session.commit()
+            if cleared:
+                logger.warning("publish: cleared stuck CLAIM=%s", cleared)
+
+            # 2) select ONE candidate that matches current filter signature
+            candidates: List[Post] = (
+                session.query(Post)
+                .filter(
+                    Post.status == PostStatus.GENERATED,
+                    Post.telegram_message_id.is_(None),
+                    Post.input_key.like(prefix + "%"),
+                )
+                .order_by(Post.created_at.asc())
+                .limit(effective_limit)
+                .all()
+            )
+
+            if not candidates:
+                return {
+                    "status": "done",
+                    "published": 0,
+                    "claimed_elsewhere": 0,
+                    "retryable": 0,
+                    "failed_empty": 0,
+                    "batch_limit": batch_limit,
+                    "effective_limit": effective_limit,
+                    "filter_sig": sig,
+                    "language": lang,
+                    "keywords": keywords_lc,
+                }
+
+            publisher = TelegramPublisher()
+            post = candidates[0]
+
+            # 3) atomic claim
+            claim = f"CLAIM:{uuid.uuid4()}"
+            updated = (
+                session.query(Post)
+                .filter(
+                    Post.id == post.id,
+                    Post.status == PostStatus.GENERATED,
+                    Post.telegram_message_id.is_(None),
+                )
+                .update({Post.telegram_message_id: claim}, synchronize_session=False)
+            )
             session.commit()
 
-        # 1) берём только те, у кого telegram_message_id IS NULL
-        posts = (
-            session.query(Post)
-            .filter(
-                Post.status == PostStatus.GENERATED,
-                Post.telegram_message_id.is_(None),
-            )
-            .order_by(Post.created_at.asc())  # FIFO
-            .limit(batch_limit)
-            .all()
-        )
+            if updated != 1:
+                return {
+                    "status": "done",
+                    "published": 0,
+                    "claimed_elsewhere": 1,
+                    "retryable": 0,
+                    "failed_empty": 0,
+                    "batch_limit": batch_limit,
+                    "effective_limit": effective_limit,
+                    "filter_sig": sig,
+                }
 
-        if not posts:
-            logger.info("publish: нет постов GENERATED для публикации")
-            return {"status": "done", "published": 0, "skipped": 0, "claimed_elsewhere": 0, "retryable": 0, "failed_empty": 0, "batch_limit": batch_limit}
-
-        publisher: TelegramPublisher | None = None
-
-        for post in posts:
-            text = (post.generated_text or "").strip()
-            if not text:
-                post.status = PostStatus.FAILED
-                post.error = "generated_text is empty"
-                failed_empty += 1
-                continue
-
-            # 2) claim (атомарно)
-            claim_id = _claim_post_for_publish(session, str(post.id))
-            session.commit()  # фиксируем claim сразу
-
-            if not claim_id:
-                claimed_elsewhere += 1
-                continue
-
-            # 3) отправка в TG
-            try:
-                if publisher is None:
-                    publisher = TelegramPublisher()
-
-                mid = publisher.send(text)
-
-                # 4) фиксируем успех (заменяем claim на реальный message_id)
-                post_db = session.get(Post, str(post.id))
-                if not post_db:
-                    continue
-
-                if post_db.telegram_message_id != claim_id:
-                    claimed_elsewhere += 1
-                    continue
-
-                post_db.status = PostStatus.PUBLISHED
-                post_db.telegram_message_id = str(mid)
-                post_db.published_at = now_utc()
-                post_db.error = None
-
+            p: Optional[Post] = session.query(Post).filter(Post.id == post.id).first()
+            if not p or not (p.generated_text or "").strip():
+                session.query(Post).filter(Post.id == post.id).update(
+                    {Post.telegram_message_id: None},
+                    synchronize_session=False,
+                )
                 session.commit()
-                published += 1
+                return {
+                    "status": "done",
+                    "published": 0,
+                    "claimed_elsewhere": 0,
+                    "retryable": 0,
+                    "failed_empty": 1,
+                    "batch_limit": batch_limit,
+                    "effective_limit": effective_limit,
+                    "filter_sig": sig,
+                }
+
+            try:
+                msg_id = publisher.publish_text(p.generated_text)
+
+                session.query(Post).filter(Post.id == post.id).update(
+                    {
+                        Post.status: PostStatus.PUBLISHED,
+                        Post.published_at: _utcnow(),
+                        Post.telegram_message_id: str(msg_id),
+                        Post.error: None,
+                    },
+                    synchronize_session=False,
+                )
+                session.commit()
+
+                return {
+                    "status": "done",
+                    "published": 1,
+                    "claimed_elsewhere": 0,
+                    "retryable": 0,
+                    "failed_empty": 0,
+                    "batch_limit": batch_limit,
+                    "effective_limit": effective_limit,
+                    "filter_sig": sig,
+                    "post_id": post.id,
+                }
 
             except Exception as e:
-                logger.exception("publish failed: %s", e)
+                logger.exception("publish: telegram error, marking RETRYABLE: %s", e)
+                session.query(Post).filter(Post.id == post.id).update(
+                    {
+                        Post.status: PostStatus.RETRYABLE,
+                        Post.error: str(e)[:2000],
+                        Post.telegram_message_id: None,
+                    },
+                    synchronize_session=False,
+                )
+                session.commit()
 
-                # снимаем claim, чтобы можно было ретраить
-                post_db = session.get(Post, str(post.id))
-                if post_db and post_db.telegram_message_id == claim_id:
-                    post_db.status = PostStatus.RETRYABLE
-                    post_db.error = str(e)
-                    post_db.telegram_message_id = None
-                    session.commit()
+                return {
+                    "status": "done",
+                    "published": 0,
+                    "claimed_elsewhere": 0,
+                    "retryable": 1,
+                    "failed_empty": 0,
+                    "batch_limit": batch_limit,
+                    "effective_limit": effective_limit,
+                    "filter_sig": sig,
+                    "post_id": post.id,
+                }
 
-                retryable += 1
-                break
-
-    return {
-        "status": "done",
-        "published": published,
-        "skipped": skipped,
-        "claimed_elsewhere": claimed_elsewhere,
-        "retryable": retryable,
-        "failed_empty": failed_empty,
-        "batch_limit": batch_limit,
-    }
+    finally:
+        _release_publish_lock(lock_token)

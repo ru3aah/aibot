@@ -1,232 +1,440 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-from typing import Optional
+import uuid
+from datetime import datetime, timezone
+from typing import List, Tuple, Optional
 
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from celery_worker import celery_app
 from app.config import settings
 from app.database.db import get_db_sync
 from app.database.models import Source, Keyword
+from app.database.data_types import SourceType
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
+MAX_ACTIVE_KEYWORDS = 5
 
-# =========================
-# Helpers: Celery triggers
-# =========================
+MENU_TEXT = (
+    "🛠️ aibot — панель управления\n\n"
+    "Выбирай раздел кнопками ниже.\n"
+)
+
+
+class KWAdd(StatesGroup):
+    waiting_word = State()
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _now_utc_naive() -> datetime:
+    # sqlite friendly naive UTC
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 
 def _send_task(task_name: str) -> str:
     res = celery_app.send_task(task_name, queue="aibot")
     return str(res.id)
 
 
-# =========================
-# Keyboards
-# =========================
-
-def kb_main_menu():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🧩 Источники", callback_data="menu:sources")
-    kb.button(text="🔑 Ключевые слова", callback_data="menu:keywords")
-    kb.button(text="🚀 Parse", callback_data="task:parse")
-    kb.button(text="🧠 Generate", callback_data="task:generate")
-    kb.button(text="📣 Publish", callback_data="task:publish")
-    kb.adjust(2, 3)
-    return kb.as_markup()
+def _norm(s: str) -> str:
+    return (s or "").strip()
 
 
-def kb_sources(rows: list[Source]):
-    kb = InlineKeyboardBuilder()
-    for s in rows:
-        mark = "✅" if s.enabled else "⛔️"
-        kb.button(text=f"{mark} {s.name}", callback_data=f"src:toggle:{s.id}")
-    kb.button(text="⬅️ Назад", callback_data="menu:home")
-    kb.adjust(1)
-    return kb.as_markup()
+def _cb(data: str) -> str:
+    return data
 
 
-def kb_keywords(rows: list[Keyword]):
-    kb = InlineKeyboardBuilder()
-    # Только просмотр (CRUD через команды оставим на следующий шаг)
-    kb.button(text="⬅️ Назад", callback_data="menu:home")
-    kb.adjust(1)
-    return kb.as_markup()
+def _kb(rows: List[List[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-# =========================
-# Text renderers
-# =========================
-
-def render_home_text() -> str:
-    return (
-        "🛠 **aibot admin**\n\n"
-        "Выберите раздел.\n\n"
-        "_Важно: меню не “уезжает”, потому что бот редактирует одно и то же сообщение._"
+def _menu_kb() -> InlineKeyboardMarkup:
+    return _kb(
+        [
+            [
+                InlineKeyboardButton(text="📰 Источники", callback_data=_cb("menu:sources")),
+                InlineKeyboardButton(text="🔑 Ключевые слова", callback_data=_cb("menu:keywords")),
+            ],
+            [
+                InlineKeyboardButton(text="🚀 Parse", callback_data=_cb("task:parse")),
+                InlineKeyboardButton(text="🧠 Generate", callback_data=_cb("task:generate")),
+                InlineKeyboardButton(text="📣 Publish", callback_data=_cb("task:publish")),
+            ],
+        ]
     )
 
 
-def render_sources_text(rows: list[Source]) -> str:
-    lines = ["🧩 **Источники**", "", "Нажимай на источник, чтобы включить/выключить:"]
-    if not rows:
-        lines.append("\n(источников нет)")
-        return "\n".join(lines)
-
-    for s in rows:
+def _sources_kb(sources: List[Source]) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    for s in sources:
         mark = "✅" if s.enabled else "⛔️"
-        lines.append(f"- {mark} **{s.name}** — `{s.type}` — `{s.url}`")
-    return "\n".join(lines)
+        stype = "SITE" if s.type == SourceType.SITE else "TG"
+        title = f"{mark} {stype} · {s.name}"
+        rows.append([InlineKeyboardButton(text=title, callback_data=_cb(f"src:toggle:{s.id}"))])
+
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=_cb("menu:root"))])
+    return _kb(rows)
 
 
-def render_keywords_text(rows: list[Keyword]) -> str:
-    lines = ["🔑 **Ключевые слова**", ""]
-    if not rows:
-        lines.append("(пусто — фильтрация не применяется)")
-        lines.append("")
-        lines.append("Добавление/удаление сделаем следующим шагом.")
-        return "\n".join(lines)
-
-    lines.append("Текущий список:")
-    for k in rows:
-        lines.append(f"- `{k.word}` (`{k.id}`)")
-    lines.append("")
-    lines.append("Добавление/удаление сделаем следующим шагом.")
-    return "\n".join(lines)
-
-
-# =========================
-# Menu actions (edit same message)
-# =========================
-
-async def show_home(message: Message):
-    await message.answer(render_home_text(), reply_markup=kb_main_menu(), parse_mode="Markdown")
+def _parse_keywords_json(raw: Optional[str]) -> List[str]:
+    """
+    Храним в JSON именно слова (уже приведённые к casefold).
+    """
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            out: List[str] = []
+            for x in data:
+                if isinstance(x, str) and x.strip():
+                    out.append(x.strip())
+            return out
+    except Exception:
+        pass
+    return []
 
 
-async def edit_to_home(cq: CallbackQuery):
-    if not cq.message:
-        await cq.answer()
-        return
-    await cq.message.edit_text(render_home_text(), reply_markup=kb_main_menu(), parse_mode="Markdown")
-    await cq.answer()
+def _dump_keywords_json(words: List[str]) -> str:
+    return json.dumps(words, ensure_ascii=False)
 
 
-async def edit_to_sources(cq: CallbackQuery):
-    if not cq.message:
-        await cq.answer()
-        return
-    with get_db_sync() as session:
-        rows = session.query(Source).order_by(Source.created_at.desc()).all()
+def _load_filter_settings_row(session) -> dict:
+    """
+    Возвращает dict: {id, language, updated_at, active_keywords_json}
+    Raw SQL — чтобы не зависеть от ORM/миграций.
+    """
+    row = session.execute(
+        """
+        SELECT id, language, updated_at, active_keywords_json
+        FROM filter_settings
+        ORDER BY updated_at DESC
+        LIMIT 1
+        """
+    ).fetchone()
 
-    await cq.message.edit_text(render_sources_text(rows), reply_markup=kb_sources(rows), parse_mode="Markdown")
-    await cq.answer()
+    if not row:
+        fs_id = str(uuid.uuid4())
+        session.execute(
+            """
+            INSERT INTO filter_settings (id, language, created_at, updated_at, active_keywords_json)
+            VALUES (:id, :language, :created_at, :updated_at, :active_keywords_json)
+            """,
+            {
+                "id": fs_id,
+                "language": "ru",
+                "created_at": _now_utc_naive(),
+                "updated_at": _now_utc_naive(),
+                "active_keywords_json": _dump_keywords_json([]),
+            },
+        )
+        session.commit()
+        return {
+            "id": fs_id,
+            "language": "ru",
+            "updated_at": _now_utc_naive(),
+            "active_keywords_json": _dump_keywords_json([]),
+        }
+
+    return {
+        "id": row[0],
+        "language": row[1],
+        "updated_at": row[2],
+        "active_keywords_json": row[3],
+    }
 
 
-async def edit_to_keywords(cq: CallbackQuery):
-    if not cq.message:
-        await cq.answer()
-        return
-    with get_db_sync() as session:
-        rows = session.query(Keyword).order_by(Keyword.word.asc()).all()
+def _get_active_keywords_words(session) -> List[str]:
+    fs = _load_filter_settings_row(session)
+    words = _parse_keywords_json(fs.get("active_keywords_json"))
+    # Держим только нормализованный вариант (casefold)
+    out: List[str] = []
+    for w in words:
+        ww = w.strip()
+        if ww:
+            out.append(ww.casefold())
+    return out
 
-    await cq.message.edit_text(render_keywords_text(rows), reply_markup=kb_keywords(rows), parse_mode="Markdown")
-    await cq.answer()
+
+def _set_active_keywords_words(session, words_casefold: List[str]) -> None:
+    """
+    words_casefold: список слов в нижнем регистре (casefold),
+    порядок важен (для вытеснения старого).
+    """
+    fs = _load_filter_settings_row(session)
+
+    # дедуп с сохранением порядка
+    seen = set()
+    ordered: List[str] = []
+    for w in words_casefold:
+        ww = (w or "").strip().casefold()
+        if not ww or ww in seen:
+            continue
+        seen.add(ww)
+        ordered.append(ww)
+
+    # лимит
+    if len(ordered) > MAX_ACTIVE_KEYWORDS:
+        ordered = ordered[-MAX_ACTIVE_KEYWORDS:]
+
+    session.execute(
+        """
+        UPDATE filter_settings
+        SET active_keywords_json=:kw, updated_at=:updated_at
+        WHERE id=:id
+        """,
+        {
+            "kw": _dump_keywords_json(ordered),
+            "updated_at": _now_utc_naive(),
+            "id": fs["id"],
+        },
+    )
+    session.commit()
 
 
-# =========================
-# Command handlers
-# =========================
+def _keywords_screen(session) -> Tuple[str, InlineKeyboardMarkup]:
+    all_kw: List[Keyword] = session.query(Keyword).order_by(Keyword.word.asc()).all()
+
+    active_words = _get_active_keywords_words(session)
+    active_set = set(active_words)
+
+    # для красивого отображения возьмём оригинальные слова из БД
+    by_cf = {(_norm(k.word).casefold()): _norm(k.word) for k in all_kw if _norm(k.word)}
+    if active_words:
+        active_line = ", ".join([by_cf.get(w, w) for w in active_words]) or "—"
+    else:
+        active_line = "—"
+
+    text = (
+        "🔑 Ключевые слова\n\n"
+        f"Активные (до {MAX_ACTIVE_KEYWORDS}): {active_line}\n\n"
+        "Нажимай на слово чтобы включить/выключить.\n"
+        "Если включишь 6-е — оно заменит самое старое из активных.\n"
+    )
+
+    rows: List[List[InlineKeyboardButton]] = []
+
+    if not all_kw:
+        rows.append([InlineKeyboardButton(text="➕ Добавить", callback_data=_cb("kw:add"))])
+        rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=_cb("menu:root"))])
+        return text + "\nКлючевых слов пока нет.", _kb(rows)
+
+    for k in all_kw:
+        w = _norm(k.word)
+        if not w:
+            continue
+        is_on = w.casefold() in active_set
+        mark = "✅" if is_on else "➕"
+        rows.append([InlineKeyboardButton(text=f"{mark} {w}", callback_data=_cb(f"kw:toggle:{k.id}"))])
+
+    rows.append([InlineKeyboardButton(text="➕ Добавить", callback_data=_cb("kw:add"))])
+    rows.append([InlineKeyboardButton(text="🧹 Сбросить активные", callback_data=_cb("kw:clear"))])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=_cb("menu:root"))])
+
+    return text, _kb(rows)
+
+
+async def _show_menu(msg: Message) -> None:
+    await msg.answer(MENU_TEXT, reply_markup=_menu_kb())
+
+
+async def _edit_menu(call: CallbackQuery) -> None:
+    await call.message.edit_text(MENU_TEXT, reply_markup=_menu_kb(), parse_mode=None)
+
 
 async def cmd_start(msg: Message):
-    # Меню показываем сразу при старте
-    await show_home(msg)
+    await _show_menu(msg)
 
 
 async def cmd_menu(msg: Message):
-    await show_home(msg)
+    await _show_menu(msg)
 
 
-# =========================
-# Callback handlers
-# =========================
-
-async def cb_menu_router(cq: CallbackQuery):
-    data = (cq.data or "")
-    if data == "menu:home":
-        await edit_to_home(cq)
-        return
-    if data == "menu:sources":
-        await edit_to_sources(cq)
-        return
-    if data == "menu:keywords":
-        await edit_to_keywords(cq)
-        return
-    await cq.answer()
+async def cb_menu_root(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await _edit_menu(call)
+    await call.answer()
 
 
-async def cb_toggle_source(cq: CallbackQuery):
-    """
-    Переключаем enabled и ОБНОВЛЯЕМ то же сообщение (кнопки не “уезжают”).
-    """
-    if not cq.message:
-        await cq.answer()
+async def cb_menu_sources(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    with get_db_sync() as session:
+        rows = session.query(Source).order_by(Source.created_at.desc()).all()
+
+    if not rows:
+        await call.message.edit_text(
+            "📰 Источники\n\nИсточников нет.",
+            reply_markup=_kb([[InlineKeyboardButton(text="⬅️ Назад", callback_data=_cb("menu:root"))]]),
+            parse_mode=None,
+        )
+        await call.answer()
         return
 
-    parts = (cq.data or "").split(":")
-    # ожидаем "src:toggle:<id>"
+    await call.message.edit_text(
+        "📰 Источники\n\nНажимай чтобы включить/выключить источник.",
+        reply_markup=_sources_kb(rows),
+        parse_mode=None,
+    )
+    await call.answer()
+
+
+async def cb_menu_keywords(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    with get_db_sync() as session:
+        text, kb = _keywords_screen(session)
+
+    await call.message.edit_text(text, reply_markup=kb, parse_mode=None)
+    await call.answer()
+
+
+async def cb_task_parse(call: CallbackQuery):
+    tid = _send_task("app.tasks.parse_news")
+    await call.answer("parse отправлен")
+    await call.message.edit_text(
+        MENU_TEXT + f"\n✅ parse_news отправлен. task_id={tid}",
+        reply_markup=_menu_kb(),
+        parse_mode=None,
+    )
+
+
+async def cb_task_generate(call: CallbackQuery):
+    tid = _send_task("app.tasks.generate_chain_post")
+    await call.answer("generate отправлен")
+    await call.message.edit_text(
+        MENU_TEXT + f"\n✅ generate_chain_post отправлен. task_id={tid}",
+        reply_markup=_menu_kb(),
+        parse_mode=None,
+    )
+
+
+async def cb_task_publish(call: CallbackQuery):
+    tid = _send_task("app.tasks.publish_latest_post")
+    await call.answer("publish отправлен")
+    await call.message.edit_text(
+        MENU_TEXT + f"\n✅ publish_latest_post отправлен. task_id={tid}",
+        reply_markup=_menu_kb(),
+        parse_mode=None,
+    )
+
+
+async def cb_source_toggle(call: CallbackQuery):
+    parts = (call.data or "").split(":")
     if len(parts) != 3:
-        await cq.answer("bad callback", show_alert=False)
+        await call.answer("bad callback")
         return
-
     source_id = parts[2]
 
     with get_db_sync() as session:
         src = session.get(Source, source_id)
         if not src:
-            await cq.answer("Источник не найден", show_alert=False)
+            await call.answer("не найдено")
             return
         src.enabled = not bool(src.enabled)
         session.commit()
-
         rows = session.query(Source).order_by(Source.created_at.desc()).all()
 
-    # короткое “toast”-уведомление без нового сообщения
-    await cq.answer("Обновлено", show_alert=False)
-
-    # перерисовываем экран источников (на месте)
-    await cq.message.edit_text(render_sources_text(rows), reply_markup=kb_sources(rows), parse_mode="Markdown")
+    await call.message.edit_reply_markup(reply_markup=_sources_kb(rows))
+    await call.answer("ok")
 
 
-async def cb_tasks(cq: CallbackQuery):
+async def cb_kw_toggle(call: CallbackQuery):
     """
-    Запускаем Celery и даём toast через answer(), без сервисных сообщений.
+    В toggle приходит id Keyword, но активные храним как слова (casefold).
     """
-    data = (cq.data or "")
-    mapping = {
-        "task:parse": "app.tasks.parse_news",
-        "task:generate": "app.tasks.generate_chain_post",
-        "task:publish": "app.tasks.publish_latest_post",
-    }
-    task_name = mapping.get(data)
-    if not task_name:
-        await cq.answer()
+    parts = (call.data or "").split(":")
+    if len(parts) != 3:
+        await call.answer("bad callback")
+        return
+    kw_id = parts[2]
+
+    with get_db_sync() as session:
+        kw = session.get(Keyword, kw_id)
+        if not kw:
+            await call.answer("не найдено")
+            return
+
+        word_cf = _norm(kw.word).casefold()
+        if not word_cf:
+            await call.answer("пустое слово")
+            return
+
+        active = _get_active_keywords_words(session)
+
+        if word_cf in active:
+            active = [x for x in active if x != word_cf]
+        else:
+            active.append(word_cf)
+            if len(active) > MAX_ACTIVE_KEYWORDS:
+                active = active[-MAX_ACTIVE_KEYWORDS:]
+
+        _set_active_keywords_words(session, active)
+        text, kb = _keywords_screen(session)
+
+    await call.message.edit_text(text, reply_markup=kb, parse_mode=None)
+    await call.answer("ok")
+
+
+async def cb_kw_clear(call: CallbackQuery):
+    with get_db_sync() as session:
+        _set_active_keywords_words(session, [])
+        text, kb = _keywords_screen(session)
+
+    await call.message.edit_text(text, reply_markup=kb, parse_mode=None)
+    await call.answer("сброшено")
+
+
+async def cb_kw_add(call: CallbackQuery, state: FSMContext):
+    await state.set_state(KWAdd.waiting_word)
+    await call.answer()
+    await call.message.edit_text(
+        "➕ Добавление ключевого слова\n\n"
+        "Отправь слово (минимум 2 символа).\n"
+        "Отмена: /menu",
+        reply_markup=None,
+        parse_mode=None,
+    )
+
+
+async def msg_kw_add_word(msg: Message, state: FSMContext):
+    word = _norm(msg.text or "")
+    if len(word) < 2:
+        await msg.answer("Слишком коротко. Минимум 2 символа. Попробуй ещё раз.")
         return
 
-    task_id = _send_task(task_name)
-    await cq.answer(f"Запущено: {task_name} ({task_id[:8]})", show_alert=False)
+    with get_db_sync() as session:
+        exists = session.query(Keyword).filter(Keyword.word == word).first()
+        if exists:
+            await state.clear()
+            await msg.answer("Такое ключевое слово уже есть. Открываю меню.")
+            await _show_menu(msg)
+            return
 
-    # остаёмся на том же экране (кнопки не “уезжают”)
-    # можно чуть обновить текст, но без необходимости — не трогаем cq.message
+        k = Keyword(word=word)
+        session.add(k)
+        session.commit()
+        session.refresh(k)
 
+    await state.clear()
+    await msg.answer(f"✅ Добавил keyword: {word}")
+    await _show_menu(msg)
 
-# =========================
-# Main
-# =========================
 
 async def main():
     if not settings.TG_BOT_TOKEN:
@@ -235,16 +443,26 @@ async def main():
     bot = Bot(token=settings.TG_BOT_TOKEN)
     dp = Dispatcher()
 
-    # commands
     dp.message.register(cmd_start, Command("start"))
     dp.message.register(cmd_menu, Command("menu"))
 
-    # callbacks
-    dp.callback_query.register(cb_menu_router, lambda c: (c.data or "").startswith("menu:"))
-    dp.callback_query.register(cb_toggle_source, lambda c: (c.data or "").startswith("src:toggle:"))
-    dp.callback_query.register(cb_tasks, lambda c: (c.data or "").startswith("task:"))
+    dp.callback_query.register(cb_menu_root, F.data == "menu:root")
+    dp.callback_query.register(cb_menu_sources, F.data == "menu:sources")
+    dp.callback_query.register(cb_menu_keywords, F.data == "menu:keywords")
 
-    logger.info("Bot started. Username will be available after first getMe().")
+    dp.callback_query.register(cb_task_parse, F.data == "task:parse")
+    dp.callback_query.register(cb_task_generate, F.data == "task:generate")
+    dp.callback_query.register(cb_task_publish, F.data == "task:publish")
+
+    dp.callback_query.register(cb_source_toggle, F.data.startswith("src:toggle:"))
+
+    dp.callback_query.register(cb_kw_toggle, F.data.startswith("kw:toggle:"))
+    dp.callback_query.register(cb_kw_clear, F.data == "kw:clear")
+    dp.callback_query.register(cb_kw_add, F.data == "kw:add")
+
+    dp.message.register(msg_kw_add_word, KWAdd.waiting_word)
+
+    logger.info("Bot started.")
     await dp.start_polling(bot)
 
 
