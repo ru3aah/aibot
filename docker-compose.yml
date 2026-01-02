@@ -62,7 +62,6 @@ services:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/0
-      # Telethon session path внутри контейнера:
       TELEGRAM_SESSION_NAME: /data/telethon/aibot
     volumes:
       - ./data/telethon:/data/telethon
@@ -101,6 +100,10 @@ services:
     environment:
       DB_MODE: postgres
       POSTGRES_URL: postgresql://postgres:postgres@postgres:5432/aibot
+      REDIS_URL: redis://redis:6379/0
+      TELEGRAM_SESSION_NAME: /data/telethon/aibot
+    volumes:
+      - ./data/telethon:/data/telethon
     command: >
       uv run python -m app.telegram.bot
 
