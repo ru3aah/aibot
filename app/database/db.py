@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import AsyncGenerator, Generator, Optional
 
 from sqlalchemy import create_engine
-from sqlalchemy.engine import make_url
+from sqlalchemy.engine import URL, make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -45,16 +45,17 @@ def _ensure_sqlite_dir(db_url: str) -> None:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
 
+def _render_url(u: URL) -> str:
+
+    return u.render_as_string(hide_password=False)
+
+
 def _sqlite_forced_sync_url() -> str:
-    """
-    ВАЖНО: когда мы не можем await settings.choose_base_url() (например внутри running event loop),
-    мы всё равно должны использовать тот же sqlite-файл, что и в choose_base_url().
-    """
-    # choose_base_url() внутри себя делает _sqlite_force_into_app_database()
-    # Повторим этот же путь синхронно.
-    forced = settings._sqlite_force_into_app_database(settings.SQLITE_URL)  # type: ignore[attr-defined]
+
+
+    forced = settings._sqlite_force_into_app_database(settings.SQLITE_URL)
     url = make_url(str(forced))
-    return str(url.set(drivername="sqlite"))
+    return _render_url(url.set(drivername="sqlite"))
 
 
 # ================================
@@ -72,11 +73,11 @@ async def init_engines() -> None:
     url = make_url(base_url)
 
     if url.drivername.startswith("sqlite"):
-        async_url = str(url.set(drivername="sqlite+aiosqlite"))
-        sync_url = str(url.set(drivername="sqlite"))
+        async_url = _render_url(url.set(drivername="sqlite+aiosqlite"))
+        sync_url = _render_url(url.set(drivername="sqlite"))
     else:
-        async_url = str(url.set(drivername="postgresql+asyncpg"))
-        sync_url = str(url.set(drivername="postgresql+psycopg"))
+        async_url = _render_url(url.set(drivername="postgresql+asyncpg"))
+        sync_url = _render_url(url.set(drivername="postgresql+psycopg"))
 
     _ensure_sqlite_dir(async_url)
     _ensure_sqlite_dir(sync_url)
@@ -122,14 +123,12 @@ def init_engines_sync() -> None:
         base_url = asyncio.run(settings.choose_base_url())
         url = make_url(str(base_url))
         if url.drivername.startswith("sqlite"):
-            sync_url = str(url.set(drivername="sqlite"))
+            sync_url = _render_url(url.set(drivername="sqlite"))
         else:
-            sync_url = str(url.set(drivername="postgresql+psycopg"))
+            sync_url = _render_url(url.set(drivername="postgresql+psycopg"))
 
     except RuntimeError:
-        # running event loop (aiogram и т.п.)
-        # ВАЖНО: не используем settings.SQLITE_URL напрямую (sqlite:///aibot.db),
-        # а форсим тот же путь, что выбирается в choose_base_url() -> app/database/aibot.db
+
         sync_url = _sqlite_forced_sync_url()
 
     _ensure_sqlite_dir(sync_url)
@@ -156,7 +155,7 @@ def init_engines_sync() -> None:
 async def init_db() -> None:
     """Create DB schema (FastAPI startup)."""
     await init_engines()
-    async with async_engine.begin() as conn:  # type: ignore[union-attr]
+    async with async_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
 
@@ -169,7 +168,7 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
     if AsyncSessionLocal is None:
         await init_engines()
 
-    session = AsyncSessionLocal()  # type: ignore[misc]
+    session = AsyncSessionLocal()
     try:
         yield session
     except Exception:

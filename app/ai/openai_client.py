@@ -12,40 +12,24 @@ logger = logging.getLogger(__name__)
 @dataclass
 class OpenAIResponse:
     """
-    Represents a response received from OpenAI.
-
-    This class encapsulates the structured response provided by OpenAI's API, including both
-    the processed content and the raw response. It is primarily designed to help users work with
-    the responses in an organized manner.
-
-    :ivar content: The processed content extracted from the OpenAI response, typically
-                   representing the main data or message intended for use.
-    :type content: str
-    :ivar raw: The full raw response received from OpenAI's API, as a dictionary containing
-               all returned metadata and information.
-    :type raw: Dict[str, Any]
+    Low-level OpenAI response wrapper (raw JSON + extracted content).
     """
     content: str
     raw: Dict[str, Any]
 
 
+@dataclass
+class ChatResult:
+    """
+    High-level result expected by generator.py: .text + .error
+    """
+    text: str
+    error: Optional[str] = None
+
+
 class OpenAIClient:
     """
-    A client for interacting with the OpenAI API.
-
-    This class provides functionality to communicate with the OpenAI API by
-    allowing users to create chat completions using the API. It handles
-    authentication and request construction, and abstracts the API interactions
-    into a simple interface for ease of use.
-
-    :ivar api_key: The API key used for authenticating with the OpenAI API.
-    :type api_key: Optional[str]
-    :ivar base_url: The base URL for the OpenAI API. Defaults to the official
-        OpenAI API endpoint if not provided.
-    :type base_url: Optional[str]
-    :ivar timeout_seconds: The timeout period, in seconds, for API requests.
-        Defaults to 60.0 seconds.
-    :type timeout_seconds: float
+    Minimal OpenAI HTTP client (no SDK).
     """
 
     def __init__(
@@ -55,10 +39,12 @@ class OpenAIClient:
         timeout_seconds: float = 60.0,
     ) -> None:
         self.api_key = api_key or getattr(settings, "OPENAI_API_KEY", None)
-        self.base_url = (base_url or getattr(settings, "OPENAI_BASE_URL",
-                                             None) or
-                         "https://api.openai.com").rstrip("/")
-        self.timeout_seconds = timeout_seconds
+        self.base_url = (
+            base_url
+            or getattr(settings, "OPENAI_BASE_URL", None)
+            or "https://api.openai.com"
+        ).rstrip("/")
+        self.timeout_seconds = float(timeout_seconds)
 
         if not self.api_key:
             raise RuntimeError("OPENAI_API_KEY is not set")
@@ -71,6 +57,7 @@ class OpenAIClient:
         user: str,
         temperature: float = 0.6,
         max_tokens: Optional[int] = None,
+        timeout_s: Optional[float] = None,
     ) -> OpenAIResponse:
         url = f"{self.base_url}/v1/chat/completions"
 
@@ -80,7 +67,7 @@ class OpenAIClient:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "temperature": temperature,
+            "temperature": float(temperature),
         }
         if max_tokens is not None:
             payload["max_tokens"] = int(max_tokens)
@@ -90,22 +77,47 @@ class OpenAIClient:
             "Content-Type": "application/json",
         }
 
+        eff_timeout = float(timeout_s) if timeout_s is not None else self.timeout_seconds
+
+        with httpx.Client(timeout=eff_timeout) as client:
+            r = client.post(url, headers=headers, json=payload)
+
+        if r.status_code >= 400:
+            body = (r.text or "")[:2000]
+            raise RuntimeError(f"OpenAI HTTP {r.status_code}: {body}")
+
+        data = r.json()
+        content = (
+            (((data.get("choices") or [None])[0] or {}).get("message") or {}).get("content")
+            or ""
+        )
+        return OpenAIResponse(content=str(content).strip(), raw=data)
+
+    def chat(
+        self,
+        *,
+        system: str,
+        user: str,
+        timeout_s: int = 45,
+        temperature: float = 0.6,
+        max_tokens: Optional[int] = None,
+        model: Optional[str] = None,
+    ) -> ChatResult:
+        """
+        Compatibility wrapper expected by app/ai/generator.py
+        Returns ChatResult(text=..., error=...) and never raises.
+        """
         try:
-            with httpx.Client(timeout=self.timeout_seconds) as client:
-                r = client.post(url, headers=headers, json=payload)
-
-            if r.status_code >= 400:
-                body = (r.text or "")[:2000]
-                raise RuntimeError(f"OpenAI HTTP {r.status_code}: {body}")
-
-            data = r.json()
-            content = (
-                (((data.get("choices") or [None])[0] or {}).get("message") or
-                 {}).get("content")
-                or ""
+            m = model or getattr(settings, "OPENAI_MODEL", None) or "gpt-4o-mini"
+            resp = self.chat_completions_create(
+                model=m,
+                system=system,
+                user=user,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout_s=float(timeout_s),
             )
-            return OpenAIResponse(content=str(content).strip(), raw=data)
-
+            return ChatResult(text=resp.content, error=None)
         except Exception as e:
-            logger.warning("OpenAIClient failed: %s", e)
-            raise
+            logger.warning("OpenAIClient.chat failed: %s", e)
+            return ChatResult(text="", error=str(e))
