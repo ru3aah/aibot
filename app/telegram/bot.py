@@ -18,6 +18,9 @@ from app.config import settings
 from app.database.db import get_db_sync
 from app.database.models import Keyword, Source
 
+from app.database.db import init_engines_sync, sync_engine
+from app.database.models import Base
+
 logger = logging.getLogger(__name__)
 
 logging.basicConfig(
@@ -898,6 +901,9 @@ async def main() -> None:
     :rtype: None
     :return: This function does not return any value.
     """
+    init_engines_sync()
+    Base.metadata.create_all(bind=sync_engine)
+
     token = getattr(settings, "TG_BOT_TOKEN", None) or getattr(settings,
                                                                "BOT_TOKEN", None)
     if not token:

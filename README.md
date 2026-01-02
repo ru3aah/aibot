@@ -1,10 +1,12 @@
 # AI Telegram News Bot (Project M4)
 
-Автоматизированный сервис для ведения Telegram-канала на основе новостей с сайтов и публичных Telegram-источников с использованием AI-генерации постов.
+Автоматизированный сервис для ведения Telegram-канала на основе новостей с 
+сайтов и публичных Telegram-источников с использованием AI-генерации постов. 
 
 Проект реализует полный конвейер:
 **парсинг → фильтрация → AI-генерация (с переводом) → публикация в Telegram**  
-с возможностью ручного управления и мониторинга через API и Telegram-бота администратора.
+с возможностью ручного управления и мониторинга через API и Telegram-бота 
+администратора. 
 
 ---
 
@@ -154,4 +156,91 @@ uv run python -m app.telegram.bot
 	•	управление источниками
 	•	управление ключевыми словами
 	•	выбор языка генерации
+
+🐳 Запуск в Docker (Docker Compose)
+
+Проект поднимается одним  docker compose up -d --build  и запускает все 
+компоненты: 
+	•	api — FastAPI + автосоздание схемы БД (таблицы)
+	•	worker — Celery worker (парсинг/генерация/публикация)
+	•	beat — Celery Beat (плановый запуск пайплайна)
+	•	postgres — база данных Postgres
+	•	redis — брокер задач Celery
+	•	bot — админ-бот (aiogram 3) для управления источниками/ключевыми 
+        словами/языком и ручного запуска задач 
+
+Проверить запуск контейнеров: 
+docker compose ps
+
+Посмотреть логи контейнеров: 
+docker compose logs -f
+
+✅ Проверка работоспособности
+
+A) Проверка API и Swagger
+
+Swagger должен открываться:
+	•	http://localhost:8000/docs
+
+Проверка “жив ли API” (зависит от того, есть ли health endpoint; если нет — 
+просто открывай /docs): 
+curl -s http://localhost:8000/docs >/dev/null && echo "API OK"
+
+Логи API:
+docker compose logs -n 200 api
+
+B) Проверка базы Postgres и таблиц
+Показать таблицы:
+docker compose exec -T postgres sh -lc 'PGPASSWORD=postgres psql -U postgres 
+-d aibot -c "\dt"' 
+
+Проверить, что источники есть (после сидинга):
+docker compose exec -T postgres sh -lc 'PGPASSWORD=postgres psql -U postgres 
+-d aibot -c "select count(*) as sources_total from sources;"' 
+
+C) Проверка Celery worker / beat
+Логи worker:
+docker compose logs -n 200 worker
+
+Логи beat:
+docker compose logs -n 200 beat
+
+D) Проверка админ-бота (aiogram)
+токен бота можно получить через @BotFather
+Проверить
+docker compose exec -T bot sh -lc 'python -c "import os; print(os.getenv
+(\"TG_BOT_TOKEN\") or os.getenv(\"TELEGRAM_BOT_TOKEN\") or os.getenv
+(\"BOT_TOKEN\"))"'  
+
+Логи бота:
+docker compose logs -n 200 bot
+
+🧩 Автосоздание таблиц и сидинг источников
+При старте FastAPI выполняется:
+	1.	создание таблиц (Base.metadata.create_all)
+	2.	сидинг источников если таблица sources пустая (из seed_sources.json)
+
+Это нужно для “первого запуска”, чтобы пайплайн сразу мог парсить.
+
+🧪 Ручной запуск пайплайна (в Docker)
+
+Через REST API
+
+Запуск задач:
+curl -s -X POST http://localhost:8000/api/tasks/parse
+curl -s -X POST http://localhost:8000/api/tasks/generate
+curl -s -X POST http://localhost:8000/api/tasks/publish
+
+Проверить, что новости появились:
+docker compose exec -T postgres sh -lc 'PGPASSWORD=postgres psql -U postgres 
+-d aibot -c "select count(*) as news_items_total from news_items;"' 
+
+Проверить, что посты создаются/публикуются:
+docker compose exec -T postgres sh -lc 'PGPASSWORD=postgres psql -U postgres 
+-d aibot -c "select id, status, telegram_message_id, published_at from posts 
+order by created_at desc limit 10;"'  
+
+
+
+
 
