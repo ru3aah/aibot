@@ -15,7 +15,6 @@ from app.database.db import get_db_sync
 from app.database.models import NewsItem, Post, PostStatus, Source
 from app.telegram.publisher import TelegramPublisher
 
-# ВАЖНО: utils.py лежит в app/utils.py (а НЕ в app/news_parser/utils.py)
 from app.utils import parse_site_source, parse_telegram_source
 
 logger = logging.getLogger(__name__)
@@ -25,6 +24,17 @@ logger = logging.getLogger(__name__)
 # Time helpers
 # ----------------------------
 def _utcnow() -> datetime:
+    """
+    Provides the current UTC time as a timezone-aware datetime object.
+
+    This function returns the current datetime in Coordinated Universal Time
+    (UTC) with timezone information included. It is useful for applications
+    that require time-aware operations or comparisons in a standard
+    timezone.
+
+    :return: The current UTC time with timezone awareness.
+    :rtype: datetime
+    """
     return datetime.now(timezone.utc)
 
 
@@ -33,8 +43,16 @@ def _utcnow() -> datetime:
 # ----------------------------
 def _get_filter_settings_row(session: Session) -> Optional[Dict[str, Any]]:
     """
-    Read latest filter_settings row via raw SQL to avoid ORM mismatch.
-    Expected columns: id, language, updated_at, active_keywords_json
+    Retrieves the most recent row from the `filter_settings` table ordered by the
+    `updated_at` field. This function executes an SQL query using the given session
+    and fetches the latest record. If a row is found, it returns the row in a
+    dictionary format. If no row exists, the function returns None.
+
+    :param session: A SQLAlchemy Session object used for database access.
+    :type session: Session
+    :return: The most recent row from the `filter_settings` table as a dictionary
+        or None if no row exists.
+    :rtype: Optional[Dict[str, Any]]
     """
     row = session.execute(
         text(
@@ -51,6 +69,21 @@ def _get_filter_settings_row(session: Session) -> Optional[Dict[str, Any]]:
 
 
 def _load_active_keywords(session: Session) -> List[str]:
+    """
+    Loads and returns a deduplicated and processed list of active keywords stored in
+    a database filter settings row. This function retrieves settings, processes the
+    JSON data to extract and clean a list of strings, and ensures that the returned
+    list contains unique lowercase non-empty strings.
+
+    :param session: Active SQLAlchemy session used to query the filter settings
+        row.
+    :type session: Session
+
+    :return: A list of unique active keywords, formatted as lowercase non-empty
+        strings. If no valid data is found or an error occurs during processing, an
+        empty list is returned.
+    :rtype: List[str]
+    """
     fs = _get_filter_settings_row(session)
     if not fs:
         return []
@@ -78,6 +111,21 @@ def _load_active_keywords(session: Session) -> List[str]:
 
 
 def _load_selected_language(session: Session, default: str = "ru") -> str:
+    """
+    Retrieve the selected language from filter settings or a default language.
+
+    This function accesses filter settings stored in the session to check for
+    a user-selected language preference. If no language is found in the filter
+    settings or the session is empty, it returns the default language. The
+    retrieved language is processed to ensure it is in lowercase and has no
+    leading or trailing whitespaces.
+
+    :param session: The session object used to retrieve the stored filter
+        settings.
+    :param default: The default language code to return if no language is
+        found. Defaults to "ru".
+    :return: The selected language code as a string.
+    """
     fs = _get_filter_settings_row(session)
     if not fs:
         return default
@@ -87,8 +135,16 @@ def _load_selected_language(session: Session, default: str = "ru") -> str:
 
 def _filter_signature(language: str, keywords_lc: List[str]) -> str:
     """
-    Stable signature for current settings to bind generated posts to active filters.
-    Stored in Post.input_key prefix: F:<sig>:...
+    Constructs a unique filtered signature string based on the given language and keywords.
+    The function accepts a language string and a list of keywords, processes them to construct
+    a formatted payload, and computes a SHA-1 hash of the payload. The first 12 characters of
+    the hash string are returned as the resulting signature.
+
+    :param language: Language code as a string. Defaults to 'ru' if not provided or empty.
+    :param keywords_lc: A list of keywords in lowercase to be included in the signature.
+                        Empty or None items are ignored, and duplicates are removed.
+    :return: A 12-character string representing the hash-based signature.
+    :rtype: str
     """
     lang = (language or "ru").strip().lower()
     kws = [k.strip().lower() for k in (keywords_lc or []) if k and k.strip()]
@@ -101,6 +157,20 @@ def _filter_signature(language: str, keywords_lc: List[str]) -> str:
 # News filtering
 # ----------------------------
 def _matches_keywords(item: NewsItem, keywords_lc: List[str]) -> bool:
+    """
+    Checks whether any of the specified keywords are present in the content of a given
+    NewsItem object. The function retrieves textual content from various attributes of
+    the NewsItem, aggregates them into a single string, and performs a case-insensitive
+    search for the keywords.
+
+    :param item: A NewsItem object containing the content to be searched.
+    :type item: NewsItem
+    :param keywords_lc: A list of keywords in lowercase to search within the item's content.
+    :type keywords_lc: List[str]
+    :return: True if at least one keyword is found in the content of the NewsItem;
+             False otherwise.
+    :rtype: bool
+    """
     if not keywords_lc:
         return True
 
@@ -120,6 +190,19 @@ def _matches_keywords(item: NewsItem, keywords_lc: List[str]) -> bool:
 
 
 def _dedupe_news(items: List[NewsItem]) -> List[NewsItem]:
+    """
+    Remove duplicate news items from a list based on their URL and title.
+
+    This function iterates through the provided list of news items and removes duplicates
+    by checking the URL and title of each item. Both the URL and title are normalized
+    (by stripping whitespace and converting to lowercase) during comparison. If a duplicate
+    is found (based on either the URL or title), the item is excluded from the output list.
+
+    :param items: A list of NewsItem objects to be filtered for duplicates.
+    :type items: List[NewsItem]
+    :return: A list of NewsItem objects with duplicates removed.
+    :rtype: List[NewsItem]
+    """
     seen_url = set()
     seen_title = set()
     out: List[NewsItem] = []
@@ -143,8 +226,16 @@ def _dedupe_news(items: List[NewsItem]) -> List[NewsItem]:
 
 def _filter_news_strict(session: Session, raw_news: List[NewsItem]) -> List[NewsItem]:
     """
-    STRICT MODE:
-    - if keywords are active and there are 0 matches -> return []
+    Filters the given raw news list based on active keywords loaded from the session
+    in strict mode, ensuring only news items matching the keywords are included. If
+    no news items match, an empty list is returned.
+
+    :param session: A database session used to load active keywords
+    :type session: Session
+    :param raw_news: List of news items to be filtered
+    :type raw_news: List[NewsItem]
+    :return: A list of filtered news items that match the active keywords
+    :rtype: List[NewsItem]
     """
     keywords_lc = _load_active_keywords(session)
 
@@ -173,6 +264,19 @@ _LOCK_KEY = "aibot:publish_lock"
 
 
 def _get_redis_url() -> Optional[str]:
+    """
+    Retrieves the Redis URL from the settings module.
+
+    This function checks for the presence of specific attributes in the
+    settings module in the given order: "REDIS_URL", "CELERY_BROKER_URL",
+    and "BROKER_URL". If any of these attributes are found and not None,
+    their value is returned as a string. If none of these attributes are
+    set, the function returns None.
+
+    :return: The Redis URL as a string or None if no relevant attribute
+        is set in the settings module.
+    :rtype: Optional[str]
+    """
     for attr in ("REDIS_URL", "CELERY_BROKER_URL", "BROKER_URL"):
         url = getattr(settings, attr, None)
         if url:
@@ -182,8 +286,20 @@ def _get_redis_url() -> Optional[str]:
 
 def _acquire_publish_lock(ttl_seconds: int = 60) -> Optional[str]:
     """
-    Returns lock token if acquired, else None.
-    Uses SET NX EX.
+    Acquires a publish lock using a Redis backend to ensure no simultaneous
+    publishing processes utilize the same resource. The lock is set with a
+    time-to-live (TTL) to ensure it eventually expires.
+
+    This function handles the initialization of a connection to a Redis server,
+    attempts to acquire the lock with a unique token, and returns the token if
+    successful. If the connection to Redis cannot be established or any other
+    errors occur, the lock acquisition is disabled.
+
+    :param ttl_seconds: The time-to-live in seconds for the acquired lock. Defaults
+        to 60 seconds.
+    :return: A unique token if the lock is successfully acquired, "NOLOCK" if the
+        lock acquisition fails or is disabled, or None if the lock is already
+        acquired.
     """
     redis_url = _get_redis_url()
     if not redis_url:
@@ -205,6 +321,22 @@ def _acquire_publish_lock(ttl_seconds: int = 60) -> Optional[str]:
 
 
 def _release_publish_lock(token: Optional[str]) -> None:
+    """
+    Releases a publish lock in the Redis database. The function checks whether a
+    given token is valid and exists. If the token is valid and matches the key in
+    Redis, it deletes the lock. If the token is invalid or doesn't exist, it skips
+    processing. This function ensures safe handling of distributed locks in Redis
+    by verifying tokens explicitly.
+
+    :param token: The lock token to verify and release. If set to None or "NOLOCK",
+                  the function will exit early without performing any operations.
+    :type token: Optional[str]
+    :raises Exception: This function suppresses exceptions that may arise from
+                       Redis-related operations or connectivity issues.
+
+    :rtype: None
+    :return: None
+    """
     if not token or token == "NOLOCK":
         return
 
@@ -235,16 +367,26 @@ def _release_publish_lock(token: Optional[str]) -> None:
 @celery_app.task(name="app.tasks.parse_news")
 def parse_news() -> Dict[str, Any]:
     """
-    Парсим ВСЕ enabled sources.
-    SITE -> parse_site_source(session, source)
-    TG   -> parse_telegram_source(session, source)
+    Parses news from multiple sources, processes the data, and logs the output. It can handle different types
+    of sources (e.g., websites, Telegram channels) and appropriately calls the relevant parsing function for
+    each type. The function commits parsed data to the database session, maintains a summary of the parsing
+    results, and rolls back the transaction in case of errors to maintain data consistency.
 
-    parse_* добавляет NewsItem в session (commit делаем здесь).
+    :param session: Database session used for querying and committing information. Retrieved and managed via
+        a context manager to handle sessions safely.
+    :param sources: List of Source objects to be processed. Each source represents an individual source of
+        news/data with its metadata for parsing.
+
+    :return: A dictionary containing the status of the operation, the total count of news items added, and a
+        list of detailed information for each processed source, including any errors encountered.
+
+    :rtype: Dict[str, Any]
     """
     results: List[Dict[str, Any]] = []
 
     with get_db_sync() as session:
-        sources: List[Source] = session.query(Source).filter(Source.enabled.is_(True)).all()
+        sources: List[Source] = session.query(Source).filter(
+            Source.enabled.is_(True)).all()
 
         total_added = 0
         for s in sources:
@@ -254,7 +396,8 @@ def parse_news() -> Dict[str, Any]:
                 elif (s.type or "").lower() in ("tg", "telegram"):
                     added = parse_telegram_source(session, s)
                 else:
-                    logger.warning("parse_news: unknown source type=%s name=%s url=%s", s.type, s.name, s.url)
+                    logger.warning("parse_news: unknown source type=%s name=%s url=%s",
+                                   s.type, s.name, s.url)
                     added = 0
 
                 session.commit()
@@ -270,7 +413,8 @@ def parse_news() -> Dict[str, Any]:
                 )
             except Exception as e:
                 session.rollback()
-                logger.exception("parse_news: failed source=%s (%s)", s.name, e)
+                logger.exception("parse_news: failed source=%s (%s)",
+                                 s.name, e)
                 results.append(
                     {
                         "source_id": s.id,
@@ -281,7 +425,8 @@ def parse_news() -> Dict[str, Any]:
                     }
                 )
 
-    return {"status": "ok", "parsed": sum(x.get("added", 0) for x in results), "sources": results}
+    return {"status": "ok", "parsed": sum(x.get("added", 0) for x in results),
+            "sources": results}
 
 
 # ----------------------------
@@ -289,7 +434,21 @@ def parse_news() -> Dict[str, Any]:
 # ----------------------------
 @celery_app.task(name="app.tasks.generate_chain_post")
 def generate_chain_post_task(_prev: Any = None) -> Dict[str, Any]:
-    from app.ai.generator import generate_chain_post  # returns tuple (text, status, error, input_news_ids_json, input_key)
+    """
+    Generates a chain post by fetching, filtering, and processing news items from
+    the database, then creates and saves a generated post in the system. If no
+    filtered news items match the active keywords, the task is skipped, and a
+    status message is returned.
+
+    :param _prev: Previous task result or input data necessary for chaining in
+        Celery tasks.
+    :type _prev: Any
+    :return: A dictionary containing details of the generated post or status
+        information in case of task skipping.
+    :rtype: Dict[str, Any>
+    """
+    from app.ai.generator import generate_chain_post
+    # returns tuple (text, status, error, input_news_ids_json, input_key)
 
     with get_db_sync() as session:
         window = max(int(getattr(settings, "PARSE_THREADS", 10)) * 3, 30)
@@ -361,7 +520,9 @@ def generate_chain_post_task(_prev: Any = None) -> Dict[str, Any]:
             created_at=_utcnow(),
             telegram_message_id=None,
             error=(gen_error or None),
-            input_news_ids=input_news_ids_json or json.dumps([n.id for n in selected_news], ensure_ascii=False),
+            input_news_ids=input_news_ids_json or json.dumps([n.id for n in
+                                                              selected_news],
+                                                             ensure_ascii=False),
             input_key=input_key,
         )
 
@@ -388,10 +549,19 @@ def generate_chain_post_task(_prev: Any = None) -> Dict[str, Any]:
 @celery_app.task(name="app.tasks.publish_latest_post")
 def publish_latest_post(_prev: Any = None) -> Dict[str, Any]:
     """
-    Публикует максимум 1 пост за запуск.
-    - clears stuck CLAIM by TTL (CLAIM_TTL_MINUTES)
-    - Redis-lock prevents parallel publish
-    - публикует только посты под текущую сигнатуру фильтра F:<sig>:
+    Publishes the latest eligible post to a Telegram channel by acquiring a lock,
+    filtering eligible posts, and updating their status in the database. If no post
+    is eligible, it returns the appropriate metadata indicating skipped actions.
+
+    :param _prev: Placeholder parameter for potential future use cases.
+    :type _prev: Any
+    :return: A dictionary containing metadata about the publishing process,
+        including the status of the operation, number of posts published,
+        and any failures or retryable errors.
+    :rtype: Dict[str, Any]
+    :raises: This function does not raise errors explicitly. Exceptions encountered
+        during Telegram publishing or database updates are handled internally and
+        logged, with the status returned in the result metadata.
     """
     batch_limit = int(getattr(settings, "PUBLISH_BATCH_LIMIT", 5))
     claim_ttl_min = int(getattr(settings, "CLAIM_TTL_MINUTES", 25))
@@ -427,7 +597,8 @@ def publish_latest_post(_prev: Any = None) -> Dict[str, Any]:
                     Post.telegram_message_id.like("CLAIM:%"),
                     Post.created_at < cutoff,
                 )
-                .update({Post.telegram_message_id: None}, synchronize_session=False)
+                .update({Post.telegram_message_id: None},
+                        synchronize_session=False)
             )
             session.commit()
             if cleared:
@@ -470,7 +641,8 @@ def publish_latest_post(_prev: Any = None) -> Dict[str, Any]:
                     Post.status == PostStatus.GENERATED,
                     Post.telegram_message_id.is_(None),
                 )
-                .update({Post.telegram_message_id: claim}, synchronize_session=False)
+                .update({Post.telegram_message_id: claim},
+                        synchronize_session=False)
             )
             session.commit()
 
@@ -486,7 +658,8 @@ def publish_latest_post(_prev: Any = None) -> Dict[str, Any]:
                     "filter_sig": sig,
                 }
 
-            p: Optional[Post] = session.query(Post).filter(Post.id == post.id).first()
+            p: Optional[Post] = session.query(Post).filter(Post.id ==
+                                                           post.id).first()
             if not p or not (p.generated_text or "").strip():
                 session.query(Post).filter(Post.id == post.id).update(
                     {Post.telegram_message_id: None},
@@ -531,7 +704,8 @@ def publish_latest_post(_prev: Any = None) -> Dict[str, Any]:
                 }
 
             except Exception as e:
-                logger.exception("publish: telegram error, marking RETRYABLE: %s", e)
+                logger.exception("publish: telegram error, marking RETRYABLE: %s",
+                                 e)
                 session.query(Post).filter(Post.id == post.id).update(
                     {
                         Post.status: PostStatus.RETRYABLE,
@@ -564,10 +738,17 @@ def publish_latest_post(_prev: Any = None) -> Dict[str, Any]:
 @celery_app.task(name="app.tasks.run_pipeline")
 def run_pipeline() -> Dict[str, Any]:
     """
-    Оркестратор для ТЗ: фоновая цепочка
-      parse_news -> generate_chain_post -> publish_latest_post
+    Executes a pipeline of tasks to process, generate, and publish news
+    content. This function initiates a Celery task chain consisting of
+    parsing news, generating posts, and publishing the latest content,
+    and returns a dictionary containing the task execution status and
+    the root task ID.
 
-    НИЧЕГО не меняет в логике отдельных задач — только связывает их в chain.
+    :returns:
+        A dictionary containing the status of the execution and the root
+        task ID of the Celery chain.
+
+    :rtype: Dict[str, Any]
     """
     result = chain(
         parse_news.s(),

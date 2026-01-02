@@ -1,0 +1,30 @@
+# secrets
+.env
+.env.*
+*.session
+
+# local data
+data/
+dump.rdb
+celerybeat-schedule*
+*.db
+app/database/*.db
+
+# python/cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# venv
+.venv/
+
+# git/ide/os
+.git/
+.idea/
+.DS_Store
+
+# misc
+*.log

@@ -11,14 +11,41 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class OpenAIResponse:
+    """
+    Represents a response received from OpenAI.
+
+    This class encapsulates the structured response provided by OpenAI's API, including both
+    the processed content and the raw response. It is primarily designed to help users work with
+    the responses in an organized manner.
+
+    :ivar content: The processed content extracted from the OpenAI response, typically
+                   representing the main data or message intended for use.
+    :type content: str
+    :ivar raw: The full raw response received from OpenAI's API, as a dictionary containing
+               all returned metadata and information.
+    :type raw: Dict[str, Any]
+    """
     content: str
     raw: Dict[str, Any]
 
 
 class OpenAIClient:
     """
-    Мини-клиент под OpenAI-compatible API:
-    POST {base_url}/v1/chat/completions
+    A client for interacting with the OpenAI API.
+
+    This class provides functionality to communicate with the OpenAI API by
+    allowing users to create chat completions using the API. It handles
+    authentication and request construction, and abstracts the API interactions
+    into a simple interface for ease of use.
+
+    :ivar api_key: The API key used for authenticating with the OpenAI API.
+    :type api_key: Optional[str]
+    :ivar base_url: The base URL for the OpenAI API. Defaults to the official
+        OpenAI API endpoint if not provided.
+    :type base_url: Optional[str]
+    :ivar timeout_seconds: The timeout period, in seconds, for API requests.
+        Defaults to 60.0 seconds.
+    :type timeout_seconds: float
     """
 
     def __init__(
@@ -28,7 +55,9 @@ class OpenAIClient:
         timeout_seconds: float = 60.0,
     ) -> None:
         self.api_key = api_key or getattr(settings, "OPENAI_API_KEY", None)
-        self.base_url = (base_url or getattr(settings, "OPENAI_BASE_URL", None) or "https://api.openai.com").rstrip("/")
+        self.base_url = (base_url or getattr(settings, "OPENAI_BASE_URL",
+                                             None) or
+                         "https://api.openai.com").rstrip("/")
         self.timeout_seconds = timeout_seconds
 
         if not self.api_key:
@@ -66,13 +95,13 @@ class OpenAIClient:
                 r = client.post(url, headers=headers, json=payload)
 
             if r.status_code >= 400:
-                # аккуратно режем, чтобы логи/ошибка не раздувались
                 body = (r.text or "")[:2000]
                 raise RuntimeError(f"OpenAI HTTP {r.status_code}: {body}")
 
             data = r.json()
             content = (
-                (((data.get("choices") or [None])[0] or {}).get("message") or {}).get("content")
+                (((data.get("choices") or [None])[0] or {}).get("message") or
+                 {}).get("content")
                 or ""
             )
             return OpenAIResponse(content=str(content).strip(), raw=data)

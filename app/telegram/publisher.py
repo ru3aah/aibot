@@ -1,9 +1,7 @@
 import asyncio
 import threading
-from typing import Optional
 
 from telethon import TelegramClient
-
 from app.config import settings
 
 
@@ -12,15 +10,14 @@ class TelegramPublisher:
     Синхронный интерфейс для Celery tasks:
       msg_id = TelegramPublisher().publish_text(text)
 
-    Внутри использует Telethon (async), но наружу отдаёт sync.
     """
 
     def __init__(self) -> None:
-        # STRICT: используем только фактические переменные из текущего .env
         api_id = getattr(settings, "TG_API_ID", None)
         api_hash = getattr(settings, "TG_API_HASH", None)
         channel_username = getattr(settings, "TELEGRAM_CHANNEL_USERNAME", None)
-        session_name = getattr(settings, "TELEGRAM_SESSION_NAME", None) or "aibot"
+        session_name = (getattr(settings, "TELEGRAM_SESSION_NAME", None) or
+                        "aibot")
 
         if not api_id:
             raise RuntimeError("TG_API_ID is not set")
@@ -43,11 +40,11 @@ class TelegramPublisher:
         await client.connect()
 
         try:
-            # Сессия должна быть уже авторизована (session-файл рядом)
             if not await client.is_user_authorized():
                 raise RuntimeError(
                     "Telegram session is not authorized. "
-                    "Authorize the Telethon session once (create session file) and rerun."
+                    "Authorize the Telethon session once (create session "
+                    "file) and rerun."
                 )
 
             msg = await client.send_message(self.channel_username, text)
@@ -61,8 +58,6 @@ class TelegramPublisher:
         """
         coro = self._publish_async(text)
 
-        # Если вдруг вызывается из уже запущенного event loop (редко для celery),
-        # выполняем в отдельном потоке с отдельным loop.
         try:
             running_loop = asyncio.get_running_loop()
             if running_loop.is_running():
@@ -90,8 +85,6 @@ class TelegramPublisher:
                     raise error["e"]
                 return int(result.get("msg_id", 0))
         except RuntimeError:
-            # нет running loop — нормальный случай для celery
             pass
 
-        # Обычный путь: просто запускаем coroutine
         return int(asyncio.run(coro))

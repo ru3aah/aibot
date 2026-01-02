@@ -1,0 +1,109 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: aibot
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d aibot"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DB_MODE: postgres
+      POSTGRES_URL: postgresql://postgres:postgres@postgres:5432/aibot
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+    ports:
+      - "8000:8000"
+    command: >
+      uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+  worker:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_started
+    env_file: .env
+    environment:
+      DB_MODE: postgres
+      POSTGRES_URL: postgresql://postgres:postgres@postgres:5432/aibot
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      # Telethon session path внутри контейнера:
+      TELEGRAM_SESSION_NAME: /data/telethon/aibot
+    volumes:
+      - ./data/telethon:/data/telethon
+    command: >
+      uv run celery -A celery_worker.celery_app worker -l info -Q aibot
+
+  beat:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      worker:
+        condition: service_started
+    env_file: .env
+    environment:
+      DB_MODE: postgres
+      POSTGRES_URL: postgresql://postgres:postgres@postgres:5432/aibot
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+    command: >
+      uv run celery -A celery_worker.celery_app beat -l info
+
+  bot:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_started
+    env_file: .env
+    environment:
+      DB_MODE: postgres
+      POSTGRES_URL: postgresql://postgres:postgres@postgres:5432/aibot
+    command: >
+      uv run python -m app.telegram.bot
+
+volumes:
+  pgdata:
+  redisdata:
