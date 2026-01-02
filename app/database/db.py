@@ -1,22 +1,19 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from contextlib import contextmanager
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncGenerator, Generator, Optional
+from typing import AsyncGenerator, Generator, Optional
 
-from sqlalchemy import create_engine, select, func
+from sqlalchemy import create_engine
 from sqlalchemy.engine import URL, make_url
-from sqlalchemy.ext.asyncio import (AsyncSession, async_sessionmaker,
-                                    create_async_engine)
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.config import settings
-from app.database.models import Base, Source
+from app.database.models import Base
 
 logger = logging.getLogger(__name__)
 
@@ -58,62 +55,12 @@ def _sqlite_forced_sync_url() -> str:
     return _render_url(url.set(drivername="sqlite"))
 
 
-def _seed_sources_path() -> Path:
-    # app/database/seed_sources.json рядом с этим файлом
-    return Path(__file__).with_name("seed_sources.json")
-
-
-async def _seed_sources_if_empty(session: AsyncSession) -> int:
-    """
-    Seed table `sources` from seed_sources.json only if `sources` is empty.
-    Returns inserted count.
-    """
-    total = await session.scalar(select(func.count()).select_from(Source))
-    if (total or 0) > 0:
-        logger.info("seed_sources: skipped (sources already exist: %s)", total)
-        return 0
-
-    p = _seed_sources_path()
-    if not p.exists():
-        logger.warning("seed_sources: file not found: %s (skipped)", p)
-        return 0
-
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-        if not isinstance(data, list):
-            raise ValueError("seed_sources.json must be a JSON array")
-    except Exception as e:
-        logger.warning("seed_sources: failed to read %s: %s (skipped)", p, e)
-        return 0
-
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
-
-    inserted = 0
-    for r in data:
-        if not isinstance(r, dict):
-            continue
-        try:
-            src = Source(
-                id=str(r["id"]),
-                type=r["type"],
-                name=str(r["name"]),
-                url=str(r.get("url") or ""),
-                enabled=bool(r.get("enabled", True)),
-                created_at=now,
-            )
-            session.add(src)
-            inserted += 1
-        except Exception:
-            logger.warning("seed_sources: bad record skipped: %r", r)
-
-    if inserted > 0:
-        await session.commit()
-        logger.info("seed_sources: inserted=%s from %s", inserted, p)
-        return inserted
-
-    logger.info("seed_sources: nothing to insert (file empty or invalid "
-                "records)")
-    return 0
+def _postgres_sync_url() -> str:
+    pg = getattr(settings, "POSTGRES_URL", None)
+    if not pg:
+        raise RuntimeError("POSTGRES_URL is not set, but DB_MODE=postgres")
+    url = make_url(str(pg))
+    return _render_url(url.set(drivername="postgresql+psycopg"))
 
 
 # ================================
@@ -157,8 +104,7 @@ async def init_engines() -> None:
     sync_engine = create_engine(
         sync_url,
         echo=settings.DEBUG,
-        connect_args={"check_same_thread": False} if sync_url.startswith(
-            "sqlite") else {},
+        connect_args={"check_same_thread": False} if sync_url.startswith("sqlite") else {},
         poolclass=StaticPool if sync_url.startswith("sqlite") else None,
     )
 
@@ -187,7 +133,12 @@ def init_engines_sync() -> None:
             sync_url = _render_url(url.set(drivername="postgresql+psycopg"))
 
     except RuntimeError:
-        sync_url = _sqlite_forced_sync_url()
+        # running event loop (aiogram, etc.)
+        # ВАЖНО: если DB_MODE=postgres — НЕЛЬЗЯ падать в sqlite.
+        if getattr(settings, "DB_MODE", "sqlite") == "postgres":
+            sync_url = _postgres_sync_url()
+        else:
+            sync_url = _sqlite_forced_sync_url()
 
     _ensure_sqlite_dir(sync_url)
 
@@ -196,8 +147,7 @@ def init_engines_sync() -> None:
     sync_engine = create_engine(
         sync_url,
         echo=settings.DEBUG,
-        connect_args={"check_same_thread": False} if sync_url.startswith(
-            "sqlite") else {},
+        connect_args={"check_same_thread": False} if sync_url.startswith("sqlite") else {},
         poolclass=StaticPool if sync_url.startswith("sqlite") else None,
     )
 
@@ -216,16 +166,6 @@ async def init_db() -> None:
     await init_engines()
     async with async_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-
-    # seed sources after schema is created
-    try:
-        if AsyncSessionLocal is None:
-            raise RuntimeError("AsyncSessionLocal is not initialized")
-        async with AsyncSessionLocal() as session:
-            await _seed_sources_if_empty(session)
-    except Exception as e:
-        # не валим startup из-за сидинга
-        logger.warning("seed_sources: skipped due to error: %s", e)
 
 
 # ================================
