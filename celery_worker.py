@@ -35,7 +35,7 @@ conf: dict = {
     "timezone": "Europe/Madrid",
     "enable_utc": True,
 
-    # Celery Beat — ИСТОЧНИК ИСТИНЫ: PARSE_INTERVAL_MINUTES
+    # Celery Beat
     "beat_schedule": {
         "run_pipeline": {
             "task": "app.tasks.run_pipeline",
@@ -46,7 +46,6 @@ conf: dict = {
     },
 }
 
-# Для Windows Celery стабильнее в single-process режиме
 if platform.system() == "Windows":
     conf["worker_pool"] = "solo"
     conf["worker_concurrency"] = 1

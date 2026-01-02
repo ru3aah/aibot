@@ -23,4 +23,6 @@ celerybeat-schedule.db
 /alembic/script.py.mako
 /aibot.session
 /alembic/versions/
-/aibot.session
+aibot.session
+celerybeat-schedule-shm
+celerybeat-schedule-wal
