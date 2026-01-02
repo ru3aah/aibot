@@ -5,6 +5,7 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+from celery import chain
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -287,7 +288,7 @@ def parse_news() -> Dict[str, Any]:
 # Celery task: generate_chain_post
 # ----------------------------
 @celery_app.task(name="app.tasks.generate_chain_post")
-def generate_chain_post_task() -> Dict[str, Any]:
+def generate_chain_post_task(_prev: Any = None) -> Dict[str, Any]:
     from app.ai.generator import generate_chain_post  # returns tuple (text, status, error, input_news_ids_json, input_key)
 
     with get_db_sync() as session:
@@ -337,20 +338,17 @@ def generate_chain_post_task() -> Dict[str, Any]:
 
         sig = _filter_signature(lang, keywords_lc)
 
-        # !!! FIX: generator возвращает tuple, не строку
         generated_text, gen_status, gen_error, input_news_ids_json, legacy_input_key = generate_chain_post(
             selected_news,
             language=lang,
         )
 
-        # всегда приводим к str, чтобы SQLite не получил tuple/None
         generated_text = (generated_text or "")
         if not isinstance(generated_text, str):
             generated_text = str(generated_text)
 
         has_text = bool(generated_text.strip())
 
-        # привязка к текущим фильтрам
         legacy_key = "-".join([n.id[:6] for n in selected_news])
         input_key = f"F:{sig}:{legacy_key}"
 
@@ -388,7 +386,7 @@ def generate_chain_post_task() -> Dict[str, Any]:
 # Celery task: publish_latest_post
 # ----------------------------
 @celery_app.task(name="app.tasks.publish_latest_post")
-def publish_latest_post() -> Dict[str, Any]:
+def publish_latest_post(_prev: Any = None) -> Dict[str, Any]:
     """
     Публикует максимум 1 пост за запуск.
     - clears stuck CLAIM by TTL (CLAIM_TTL_MINUTES)
@@ -421,7 +419,6 @@ def publish_latest_post() -> Dict[str, Any]:
             sig = _filter_signature(lang, keywords_lc)
             prefix = f"F:{sig}:"
 
-            # 1) clear stuck claims
             cutoff = _utcnow() - timedelta(minutes=claim_ttl_min)
             cleared = (
                 session.query(Post)
@@ -436,7 +433,6 @@ def publish_latest_post() -> Dict[str, Any]:
             if cleared:
                 logger.warning("publish: cleared stuck CLAIM=%s", cleared)
 
-            # 2) select ONE candidate
             candidates: List[Post] = (
                 session.query(Post)
                 .filter(
@@ -466,7 +462,6 @@ def publish_latest_post() -> Dict[str, Any]:
             publisher = TelegramPublisher()
             post = candidates[0]
 
-            # 3) atomic claim
             claim = f"CLAIM:{uuid.uuid4()}"
             updated = (
                 session.query(Post)
@@ -510,7 +505,6 @@ def publish_latest_post() -> Dict[str, Any]:
                 }
 
             try:
-                # !!! FIX: используем метод publish_text (и он будет в TelegramPublisher)
                 msg_id = publisher.publish_text(p.generated_text)
 
                 session.query(Post).filter(Post.id == post.id).update(
@@ -562,3 +556,23 @@ def publish_latest_post() -> Dict[str, Any]:
 
     finally:
         _release_publish_lock(lock_token)
+
+
+# ----------------------------
+# Celery task: run_pipeline (parse -> generate -> publish)
+# ----------------------------
+@celery_app.task(name="app.tasks.run_pipeline")
+def run_pipeline() -> Dict[str, Any]:
+    """
+    Оркестратор для ТЗ: фоновая цепочка
+      parse_news -> generate_chain_post -> publish_latest_post
+
+    НИЧЕГО не меняет в логике отдельных задач — только связывает их в chain.
+    """
+    result = chain(
+        parse_news.s(),
+        generate_chain_post_task.s(),
+        publish_latest_post.s(),
+    ).apply_async()
+
+    return {"status": "started", "root_task_id": result.id}

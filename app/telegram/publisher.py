@@ -1,76 +1,97 @@
-# app/telegram/publisher.py
-from __future__ import annotations
-
 import asyncio
-import os
-from pathlib import Path
+import threading
+from typing import Optional
 
 from telethon import TelegramClient
 
-
-def _load_dotenv_no_override(dotenv_path: Path) -> None:
-    """
-    Минимальный загрузчик .env:
-    - читает KEY=VALUE
-    - игнорирует пустые строки и комментарии
-    - НЕ перезаписывает уже существующие переменные окружения
-    """
-    if not dotenv_path.exists():
-        return
-
-    for raw_line in dotenv_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" not in line:
-            continue
-
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-
-        if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
-            value = value[1:-1]
-
-        if key and key not in os.environ:
-            os.environ[key] = value
+from app.config import settings
 
 
 class TelegramPublisher:
+    """
+    Синхронный интерфейс для Celery tasks:
+      msg_id = TelegramPublisher().publish_text(text)
+
+    Внутри использует Telethon (async), но наружу отдаёт sync.
+    """
+
     def __init__(self) -> None:
-        # <project_root>/.env
-        project_root = Path(__file__).resolve().parents[2]
-        _load_dotenv_no_override(project_root / ".env")
+        # STRICT: используем только фактические переменные из текущего .env
+        api_id = getattr(settings, "TG_API_ID", None)
+        api_hash = getattr(settings, "TG_API_HASH", None)
+        channel_username = getattr(settings, "TELEGRAM_CHANNEL_USERNAME", None)
+        session_name = getattr(settings, "TELEGRAM_SESSION_NAME", None) or "aibot"
 
-        api_id = os.getenv("TG_API_ID")
-        api_hash = os.getenv("TG_API_HASH")
-        session_name = os.getenv("TELEGRAM_SESSION_NAME")
-        channel_username = os.getenv("TELEGRAM_CHANNEL_USERNAME")
-
-        if not api_id or not api_hash:
-            raise RuntimeError("TG_API_ID/TG_API_HASH are not set")
-        if not session_name:
-            raise RuntimeError("TELEGRAM_SESSION_NAME is not set")
+        if not api_id:
+            raise RuntimeError("TG_API_ID is not set")
+        if not api_hash:
+            raise RuntimeError("TG_API_HASH is not set")
         if not channel_username:
             raise RuntimeError("TELEGRAM_CHANNEL_USERNAME is not set")
 
         try:
-            self.api_id: int = int(api_id)
-        except ValueError as e:
-            raise RuntimeError("TG_API_ID must be an integer") from e
+            self.api_id = int(api_id)
+        except Exception as e:
+            raise RuntimeError(f"TG_API_ID must be int, got: {api_id!r}") from e
 
-        self.api_hash: str = api_hash
-        self.session_name: str = session_name
-        self.channel_username: str = channel_username
+        self.api_hash = str(api_hash)
+        self.channel_username = str(channel_username)
+        self.session_name = str(session_name)
 
-    async def _publish_text_async(self, text: str) -> int:
-        async with TelegramClient(self.session_name, self.api_id, self.api_hash) as client:
-            msg = await client.send_message(self.channel_username, text, link_preview=False)
-            return msg.id
+    async def _publish_async(self, text: str) -> int:
+        client = TelegramClient(self.session_name, self.api_id, self.api_hash)
+        await client.connect()
+
+        try:
+            # Сессия должна быть уже авторизована (session-файл рядом)
+            if not await client.is_user_authorized():
+                raise RuntimeError(
+                    "Telegram session is not authorized. "
+                    "Authorize the Telethon session once (create session file) and rerun."
+                )
+
+            msg = await client.send_message(self.channel_username, text)
+            return int(msg.id)
+        finally:
+            await client.disconnect()
 
     def publish_text(self, text: str) -> int:
         """
-        Синхронная обёртка для Celery.
-        Возвращает int message_id.
+        Sync wrapper. Возвращает message_id (int).
         """
-        return asyncio.run(self._publish_text_async(text))
+        coro = self._publish_async(text)
+
+        # Если вдруг вызывается из уже запущенного event loop (редко для celery),
+        # выполняем в отдельном потоке с отдельным loop.
+        try:
+            running_loop = asyncio.get_running_loop()
+            if running_loop.is_running():
+                result: dict = {}
+                error: dict = {}
+
+                def _runner() -> None:
+                    loop = asyncio.new_event_loop()
+                    try:
+                        asyncio.set_event_loop(loop)
+                        result["msg_id"] = loop.run_until_complete(coro)
+                    except Exception as e:
+                        error["e"] = e
+                    finally:
+                        try:
+                            loop.close()
+                        except Exception:
+                            pass
+
+                t = threading.Thread(target=_runner, daemon=True)
+                t.start()
+                t.join()
+
+                if "e" in error:
+                    raise error["e"]
+                return int(result.get("msg_id", 0))
+        except RuntimeError:
+            # нет running loop — нормальный случай для celery
+            pass
+
+        # Обычный путь: просто запускаем coroutine
+        return int(asyncio.run(coro))

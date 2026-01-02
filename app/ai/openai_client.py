@@ -1,67 +1,82 @@
 import logging
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
 
-from openai import OpenAI
-from openai import RateLimitError, OpenAIError, AuthenticationError, BadRequestError, APIError
+import httpx
 
 from app.config import settings
-from app.database.data_types import PostStatus
 
 logger = logging.getLogger(__name__)
 
 
-def _get_client() -> Optional[OpenAI]:
-    if not settings.OPEN_AI_API_KEY:
-        return None
-    return OpenAI(api_key=settings.OPEN_AI_API_KEY)
+@dataclass
+class OpenAIResponse:
+    content: str
+    raw: Dict[str, Any]
 
 
-def make_request(
-    instructions: str,
-    prompt: str,
-    temperature: float = 0.7,
-    max_tokens: int = 700,
-) -> Tuple[Optional[str], PostStatus, Optional[str]]:
+class OpenAIClient:
+    """
+    Мини-клиент под OpenAI-compatible API:
+    POST {base_url}/v1/chat/completions
+    """
 
-    client = _get_client()
-    if not client:
-        return None, PostStatus.SKIPPED_QUOTA, "OPEN_AI_API_KEY missing"
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        timeout_seconds: float = 60.0,
+    ) -> None:
+        self.api_key = api_key or getattr(settings, "OPENAI_API_KEY", None)
+        self.base_url = (base_url or getattr(settings, "OPENAI_BASE_URL", None) or "https://api.openai.com").rstrip("/")
+        self.timeout_seconds = timeout_seconds
 
-    if not settings.OPEN_AI_MODEL:
-        return None, PostStatus.FAILED, "OPEN_AI_MODEL missing"
+        if not self.api_key:
+            raise RuntimeError("OPENAI_API_KEY is not set")
 
-    try:
-        response = client.responses.create(
-            model=settings.OPEN_AI_MODEL,
-            instructions=instructions,
-            input=prompt,
-            temperature=temperature,
-            max_output_tokens=max_tokens,
-        )
+    def chat_completions_create(
+        self,
+        *,
+        model: str,
+        system: str,
+        user: str,
+        temperature: float = 0.6,
+        max_tokens: Optional[int] = None,
+    ) -> OpenAIResponse:
+        url = f"{self.base_url}/v1/chat/completions"
 
-        text = getattr(response, "output_text", None)
-        if text and text.strip():
-            return text.strip(), PostStatus.GENERATED, None
+        payload: Dict[str, Any] = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": temperature,
+        }
+        if max_tokens is not None:
+            payload["max_tokens"] = int(max_tokens)
 
-        return None, PostStatus.RETRYABLE, "empty output_text"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
 
-    except AuthenticationError as e:
-        return None, PostStatus.FAILED, str(e)
+        try:
+            with httpx.Client(timeout=self.timeout_seconds) as client:
+                r = client.post(url, headers=headers, json=payload)
 
-    except BadRequestError as e:
-        return None, PostStatus.FAILED, str(e)
+            if r.status_code >= 400:
+                # аккуратно режем, чтобы логи/ошибка не раздувались
+                body = (r.text or "")[:2000]
+                raise RuntimeError(f"OpenAI HTTP {r.status_code}: {body}")
 
-    except RateLimitError as e:
-        msg = str(e)
-        if "insufficient_quota" in msg:
-            return None, PostStatus.SKIPPED_QUOTA, msg
-        return None, PostStatus.RETRYABLE, msg
+            data = r.json()
+            content = (
+                (((data.get("choices") or [None])[0] or {}).get("message") or {}).get("content")
+                or ""
+            )
+            return OpenAIResponse(content=str(content).strip(), raw=data)
 
-    except APIError as e:
-        return None, PostStatus.RETRYABLE, str(e)
-
-    except OpenAIError as e:
-        return None, PostStatus.RETRYABLE, str(e)
-
-    except Exception as e:
-        return None, PostStatus.RETRYABLE, str(e)
+        except Exception as e:
+            logger.warning("OpenAIClient failed: %s", e)
+            raise

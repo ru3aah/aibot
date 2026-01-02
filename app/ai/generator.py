@@ -1,191 +1,132 @@
-from __future__ import annotations
-
 import json
 import logging
-import re
-from typing import List, Tuple, Optional
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
-from app.config import settings
-from app.database.data_types import PostStatus
 from app.database.models import NewsItem
+from app.ai.openai_client import OpenAIClient
 
 logger = logging.getLogger(__name__)
 
 
-def _make_input_ids_and_key(news: List[NewsItem]) -> tuple[str, str]:
-    ids = [str(n.id) for n in news]
-    ids_json = json.dumps(ids, ensure_ascii=False)
-    key = "-".join(i[:6] for i in ids)
-    return ids_json, key
-
-
-def _clean_md(text: str) -> str:
-    """Лёгкая чистка markdown: убираем лишние пробелы, двойные пустые строки и т.п."""
-    if not text:
-        return ""
-    text = text.strip()
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text
+@dataclass
+class GenResult:
+    text: str
+    status: str
+    error: Optional[str]
+    input_news_ids_json: str
+    input_key: str
 
 
 def _fallback_digest(news: List[NewsItem], note: Optional[str] = None) -> str:
-    """Фоллбек без OpenAI — всегда генерит дайджест."""
+    """Фоллбек без OpenAI — всегда генерит дайджест из оригинальных текстов/заголовков."""
     lines: List[str] = []
-    lines.append("🧾 **IT-дайджест (авто-режим, без LLM)**")
-    lines.append("")
-    for idx, n in enumerate(news, 1):
-        title = (n.title or "").strip() or "Без заголовка"
-        url = (n.url or "").strip()
-        src_name = ""
-        try:
-            # relationship может быть не загружен — ок, просто пропустим
-            if getattr(n, "source", None) and getattr(n.source, "name", None):
-                src_name = str(n.source.name).strip()
-        except Exception:
-            src_name = ""
 
-        if url:
-            item = f"{idx}. [{title}]({url})"
-        else:
-            item = f"{idx}. {title}"
-
-        if src_name:
-            item += f" — _{src_name}_"
-
-        lines.append(item)
-
-    lines.append("")
     if note:
-        lines.append(f"⚙️ _Примечание: {note}_")
-    else:
-        lines.append("⚙️ _Примечание: OpenAI недоступен — использован безопасный фоллбек._")
+        lines.append(note)
+        lines.append("")  # пустая строка
 
-    return "\n".join(lines)
+    for n in news:
+        title = (n.title or "").strip()
+        url = (n.url or "").strip()
+        if title and url:
+            lines.append(f"- {title} ({url})")
+        elif title:
+            lines.append(f"- {title}")
+
+    if not lines or (note and len(lines) <= 2):
+        # если новостей нет (или есть только note + пустая строка)
+        if note:
+            return f"{note}\n\n⚠️ Нет данных для поста."
+        return "⚠️ Нет данных для поста."
+
+    return "\n".join(lines).strip()
 
 
-def _openai_generate(news: List[NewsItem]) -> str:
+def _normalize_lang(language: str) -> str:
+    lang = (language or "ru").strip().lower()
+    if lang not in ("ru", "en", "es", "de"):
+        lang = "ru"
+    return lang
+
+
+def _openai_generate(news: List[NewsItem], language: str) -> str:
     """
-    Генерация через OpenAI.
-    Поддерживаем разные варианты окружения:
-    - openai>=1.x: from openai import OpenAI
-    - openai<1.x: import openai
+    Генерация через OpenAI (через наш OpenAIClient без SDK).
+    Итоговый текст обязан быть на выбранном языке независимо от языка входных новостей.
     """
-    model = getattr(settings, "OPENAI_MODEL", None) or "gpt-4o-mini"
-    api_key = getattr(settings, "OPENAI_API_KEY", None)
-
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is not set")
-
-    # Собираем контекст
-    items = []
+    # компактный контекст
+    bullets: List[str] = []
     for n in news:
         title = (n.title or "").strip()
         summary = (n.summary or "").strip()
         url = (n.url or "").strip()
-        src = ""
-        try:
-            if getattr(n, "source", None) and getattr(n.source, "name", None):
-                src = str(n.source.name).strip()
-        except Exception:
-            src = ""
+        raw = (n.raw_text or "").strip()
 
-        chunk = f"- Title: {title}\n  Source: {src}\n  URL: {url}\n  Summary: {summary}".strip()
-        items.append(chunk)
+        chunk = title
+        if summary:
+            chunk += f"\n{summary}"
+        elif raw:
+            chunk += f"\n{raw[:800]}"
+        if url:
+            chunk += f"\nURL: {url}"
+        bullets.append(chunk)
 
-    user_prompt = (
-        "Сгенерируй один пост для IT-новостного Telegram-канала на русском.\n"
-        "Требования:\n"
-        "- 6–10 коротких пунктов\n"
-        "- в начале 1 строка-заголовок\n"
-        "- стиль живой, но без кликбейта\n"
-        "- ссылки оставь как есть\n\n"
-        "Новости:\n" + "\n\n".join(items)
+    lang = _normalize_lang(language)
+
+    system = (
+        "Ты редактор Telegram-канала. Сгенерируй один короткий пост по списку новостей. "
+        "Формат: заголовок + 3-6 буллетов + ссылка(и) в конце. "
+        "Без воды. Без упоминания 'я ИИ'. "
+        "ВАЖНО: итоговый текст должен быть на выбранном языке, независимо от языка входных новостей; "
+        "если входные новости на другом языке — переведи смысл на выбранный язык."
     )
 
-    # Пытаемся openai>=1
-    try:
-        from openai import OpenAI  # type: ignore
+    if lang == "en":
+        system += " Write in English."
+    elif lang == "es":
+        system += " Escribe en español."
+    elif lang == "de":
+        system += " Schreibe auf Deutsch."
+    else:
+        system += " Пиши по-русски."
 
-        client = OpenAI(api_key=api_key)
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": "Ты редактор IT-новостного Telegram-канала."},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.6,
-        )
-        text = resp.choices[0].message.content or ""
-        return _clean_md(text)
-    except Exception as e_new:
-        # Пытаемся legacy openai<1
-        try:
-            import openai  # type: ignore
+    user = "Новости:\n\n" + "\n\n---\n\n".join(bullets)
 
-            openai.api_key = api_key
-            resp = openai.ChatCompletion.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": "Ты редактор IT-новостного Telegram-канала."},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.6,
-            )
-            text = resp["choices"][0]["message"]["content"] or ""
-            return _clean_md(text)
-        except Exception:
-            # если оба варианта не сработали — отдаём исходную ошибку (new sdk),
-            # а снаружи уже решим: фоллбек или FAILED
-            raise e_new
+    client = OpenAIClient()
+    res = client.chat(system=system, user=user, timeout_s=45)
+
+    if res.error:
+        raise RuntimeError(res.error)
+
+    return (res.text or "").strip()
 
 
-def generate_chain_post(
-    news: List[NewsItem],
-) -> Tuple[Optional[str], PostStatus, Optional[str], str, str]:
+def generate_chain_post(news: List[NewsItem], language: str = "ru") -> Tuple[str, str, Optional[str], str, str]:
     """
     Возвращает:
-      text, status, error, input_news_ids_json, input_key
+      (text, status, error, input_news_ids_json, input_key)
 
-    Логика:
-    - Всегда сначала пытаемся OpenAI.
-    - Если OpenAI недоступен/квота/ключ/429/401/... -> фоллбек и status=GENERATED
-    - Если OpenAI упал по другой причине -> тоже фоллбек, но error сохраняем (status=GENERATED),
-      чтобы дальше можно было публиковать обходным путём.
+    ВАЖНО: tasks.py должен распаковывать tuple, а не писать его в БД как строку.
     """
-    ids_json, key = _make_input_ids_and_key(news)
+    ids = [n.id for n in news if getattr(n, "id", None)]
+    input_news_ids_json = json.dumps(ids, ensure_ascii=False)
+
+    # legacy input_key (короткий ключ)
+    input_key = "-".join([i[:6] for i in ids]) if ids else "none"
+
+    # нормализуем язык заранее (чтобы "de" точно проходил дальше)
+    lang = _normalize_lang(language)
 
     try:
-        text = _openai_generate(news)
+        text = _openai_generate(news, language=lang)
         if not text:
-            text = _fallback_digest(news, note="OpenAI вернул пустой ответ — использован фоллбек.")
-        return text, PostStatus.GENERATED, None, ids_json, key
+            text = _fallback_digest(news, note="⚠️ OpenAI вернул пустой ответ — публикация на языке оригинала.")
+        return str(text), "GENERATED", None, input_news_ids_json, input_key
 
     except Exception as e:
         err = str(e)
-
-        quota_like = any(
-            s in err.lower()
-            for s in [
-                "insufficient_quota",
-                "exceeded your current quota",
-                "quota",
-                "api_key",
-                "unauthorized",
-                "authentication",
-                "invalid api key",
-                "401",
-                "403",
-                "429",
-            ]
-        )
-
-        if quota_like:
-            logger.warning("OpenAI unavailable (%s) -> fallback digest", err)
-            text = _fallback_digest(news, note="Квота/ключ OpenAI недоступны — использован фоллбек.")
-            return text, PostStatus.GENERATED, None, ids_json, key
-
-        # НЕ квотная ошибка -> тоже фоллбек (по твоей договорённости),
-        # но ошибку фиксируем в error, чтобы было видно, что AI реально упал.
-        logger.exception("OpenAI генерация упала (не квота): %s", err)
-        text = _fallback_digest(news, note="OpenAI упал по ошибке — использован фоллбек.")
-        return text, PostStatus.GENERATED, err, ids_json, key
+        logger.warning("OpenAI generation failed (%s) -> fallback digest", err)
+        # Требование: при недоступности ИИ — добавляем сообщение и публикуем на языке оригинала
+        text = _fallback_digest(news, note="⚠️ ИИ недоступен, публикация на языке оригинала")
+        return str(text), "GENERATED", err, input_news_ids_json, input_key

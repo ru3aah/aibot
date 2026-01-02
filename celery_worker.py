@@ -11,7 +11,6 @@ celery_app = Celery(
     include=["app.tasks"],
 )
 
-# Базовая конфигурация Celery + Beat
 conf: dict = {
     # сериализация
     "task_serializer": "json",
@@ -24,6 +23,7 @@ conf: dict = {
         "app.tasks.parse_news": {"queue": "aibot"},
         "app.tasks.generate_chain_post": {"queue": "aibot"},
         "app.tasks.publish_latest_post": {"queue": "aibot"},
+        "app.tasks.run_pipeline": {"queue": "aibot"},
     },
 
     # надёжность
@@ -35,10 +35,10 @@ conf: dict = {
     "timezone": "Europe/Madrid",
     "enable_utc": True,
 
-    # Celery Beat (период берём строго из .env)
+    # Celery Beat — ИСТОЧНИК ИСТИНЫ: PARSE_INTERVAL_MINUTES
     "beat_schedule": {
-        "parse_news": {
-            "task": "app.tasks.parse_news",
+        "run_pipeline": {
+            "task": "app.tasks.run_pipeline",
             "schedule": timedelta(
                 minutes=int(settings.PARSE_INTERVAL_MINUTES)
             ),
