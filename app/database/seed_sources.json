@@ -1,0 +1,23 @@
+[
+  {
+    "id": "b6b5d7c5-7e6e-4f6d-9a7e-7f8c2d1a0a01",
+    "type": "SITE",
+    "name": "TechCrunch",
+    "url": "https://techcrunch.com",
+    "enabled": true
+  },
+  {
+    "id": "b6b5d7c5-7e6e-4f6d-9a7e-7f8c2d1a0a02",
+    "type": "SITE",
+    "name": "The Verge",
+    "url": "https://www.theverge.com",
+    "enabled": true
+  },
+  {
+    "id": "b6b5d7c5-7e6e-4f6d-9a7e-7f8c2d1a0a03",
+    "type": "SITE",
+    "name": "Habr",
+    "url": "https://habr.com",
+    "enabled": true
+  }
+]
